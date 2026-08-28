@@ -24,7 +24,8 @@ from aiogram.types import (
     KeyboardButton, 
     ReplyKeyboardRemove,
     BotCommand,
-    BotCommandScopeChat
+    BotCommandScopeChat,
+    FSInputFile
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -40,6 +41,7 @@ PORT = int(os.getenv("PORT", 5000))
 IG_APP_SECRET = os.getenv("IG_APP_SECRET", "")  # App Secret из Meta для проверки подписи вебхука
 IG_APP_ID = os.getenv("IG_APP_ID", "")  # App ID из Meta — нужен для автопродления Instagram-токена
 GRAPH_API_URL = "https://graph.facebook.com/v19.0"
+COURSE_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "course")
 TOKEN_RENEW_CHECK_INTERVAL = 24 * 3600  # проверяем раз в сутки
 TOKEN_RENEW_THRESHOLD = 5 * 86400  # продлеваем, если до истечения осталось меньше 5 дней
 
@@ -671,14 +673,16 @@ async def process_channel_autolink_input(msg: types.Message, state: FSMContext):
         )
 
 def get_course_posts() -> list:
-    """Материалы курса «ИИ-Ремесло», разбитые на посты для канала."""
+    """Материалы курса «ИИ-Ремесло»: (файл обложки или None, текст поста)."""
     return [
         (
+            "00_cover.png",
             "🪶 <b>ИИ-Ремесло</b>\n"
             "Курс: заработок на нейросетях и ИИ\n\n"
             "3 модуля, 9 уроков — без воды. Дальше по порядку пойдут посты с материалами."
         ),
         (
+            "01_module1.png",
             "<b>Модуль 1 — Карта возможностей</b>\n"
             "Прежде чем выбирать инструмент, стоит понять сам рынок.\n\n"
             "<b>Урок 1.1 — Четыре модели заработка на нейросетях</b>\n"
@@ -698,6 +702,7 @@ def get_course_posts() -> list:
             "результат за 1–2 дня? Ниша с наибольшим числом «да» — та, с которой стоит начинать."
         ),
         (
+            "02_module2.png",
             "<b>Модуль 2 — Ремесло формулировок</b>\n"
             "Промпт-инжиниринг — это навык точно формулировать задачу, и он продаётся так же, "
             "как копирайтинг или дизайн.\n\n"
@@ -721,6 +726,7 @@ def get_course_posts() -> list:
             "альтернативы без ИИ и ставьте на 30–50% ниже, поднимая цену с каждым отзывом."
         ),
         (
+            "03_module3.png",
             "<b>Модуль 3 — Конвейер контента</b>\n"
             "Вторая модель заработка — не под заказ, а впрок: генерировать контент заранее "
             "и продавать многократно.\n\n"
@@ -738,6 +744,7 @@ def get_course_posts() -> list:
             "рабочий пример."
         ),
         (
+            "04_summary.png",
             "<b>Итог — набор на первую неделю</b>\n\n"
             "✅ Выбрана ниша по чек-листу из урока 1.3\n"
             "✅ Установлен один текстовый и один визуальный инструмент\n"
@@ -769,7 +776,18 @@ async def process_publish_course_input(msg: types.Message, state: FSMContext):
     await state.clear()
     posts = get_course_posts()
     sent, failed = 0, 0
-    for text in posts:
+    for image_name, text in posts:
+        if image_name:
+            image_path = os.path.join(COURSE_ASSETS_DIR, image_name)
+            if os.path.exists(image_path):
+                try:
+                    await bot.send_photo(chat_id=chat_ref, photo=FSInputFile(image_path))
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logging.error(f"Не удалось отправить обложку {image_name} в {chat_ref}: {e}")
+            else:
+                logging.error(f"Файл обложки не найден на диске: {image_path}")
+
         try:
             await bot.send_message(chat_id=chat_ref, text=text, parse_mode="HTML")
         except Exception as e:
