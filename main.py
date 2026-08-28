@@ -301,6 +301,7 @@ class AdminStates(StatesGroup):
     waiting_for_payment_token = State()
     waiting_for_course_link = State()
     waiting_for_channel_for_autolink = State()
+    waiting_for_channel_for_course_post = State()
     waiting_for_course_price = State()
     waiting_for_course_title = State()
     waiting_for_course_start_msg = State()
@@ -313,7 +314,7 @@ def get_admin_reply_kb():
             [KeyboardButton(text="📝 Текст приветствия"), KeyboardButton(text="🖼 Фото обложки")],
             [KeyboardButton(text="🏷 Название курса"), KeyboardButton(text="💰 Цена курса")],
             [KeyboardButton(text="🔗 Ссылка на канал"), KeyboardButton(text="🪄 Автоссылка на канал")],
-            [KeyboardButton(text="💳 Токен ЮKassa")],
+            [KeyboardButton(text="📤 Опубликовать курс в канал"), KeyboardButton(text="💳 Токен ЮKassa")],
             [KeyboardButton(text="🎯 Кодовое слово IG"), KeyboardButton(text="✉️ Текст Direct (IG)")],
             [KeyboardButton(text="💬 Ответ под комментом (IG)"), KeyboardButton(text="🔐 Verify Token (IG)")],
             [KeyboardButton(text="🔑 Instagram Token"), KeyboardButton(text="📋 Текущие настройки")],
@@ -644,6 +645,132 @@ async def process_channel_autolink_input(msg: types.Message, state: FSMContext):
             parse_mode="Markdown"
         )
 
+def get_course_posts() -> list:
+    """Материалы курса «ИИ-Ремесло», разбитые на посты для канала."""
+    return [
+        (
+            "🪶 **ИИ-Ремесло**\n"
+            "Курс: заработок на нейросетях и ИИ\n\n"
+            "3 модуля, 9 уроков — без воды. Дальше по порядку пойдут посты с материалами."
+        ),
+        (
+            "**Модуль 1 — Карта возможностей**\n"
+            "Прежде чем выбирать инструмент, стоит понять сам рынок.\n\n"
+            "**Урок 1.1 — Четыре модели заработка на нейросетях**\n"
+            "1) Услуги на фрилансе — вы выполняете задачи заказчика с помощью нейросетей быстрее и дешевле.\n"
+            "2) Продажа готового контента — генерируете заранее и продаёте многократно.\n"
+            "3) Автоматизация под ключ — собираете рабочие связки (боты, воронки) для бизнеса.\n"
+            "4) Обучение и консалтинг — учите других тому, что уже освоили сами.\n"
+            "Начинать разумнее с 1 и 2 — низкий порог входа, быстрая обратная связь от рынка.\n\n"
+            "**Урок 1.2 — Инструменты для старта**\n"
+            "• ChatGPT / Claude — тексты, структура, код\n"
+            "• Midjourney — изображения высокого качества\n"
+            "• ElevenLabs — синтез и клонирование голоса\n"
+            "• CapCut — быстрый монтаж коротких видео\n\n"
+            "**Урок 1.3 — Как выбрать нишу за вечер**\n"
+            "Отметьте для себя: делали что-то похожее руками? готовы показывать результат публично? "
+            "видите минимум трёх конкурентов, которые на этом зарабатывают? можете показать первый "
+            "результат за 1–2 дня? Ниша с наибольшим числом «да» — та, с которой стоит начинать."
+        ),
+        (
+            "**Модуль 2 — Ремесло формулировок**\n"
+            "Промпт-инжиниринг — это навык точно формулировать задачу, и он продаётся так же, "
+            "как копирайтинг или дизайн.\n\n"
+            "**Урок 2.1 — Анатомия рабочего промпта**\n"
+            "Пять частей: Роль (кем выступает нейросеть) → Контекст (для кого и зачем) → "
+            "Задача (что именно сделать) → Формат (в каком виде нужен ответ) → Ограничения "
+            "(чего избегать).\n\n"
+            "Пример каркаса:\n"
+            "```\n"
+            "Роль: ты — опытный копирайтер маркетплейсов.\n"
+            "Контекст: карточка товара, ниша — детские рюкзаки.\n"
+            "Задача: продающее описание из трёх абзацев.\n"
+            "Формат: заголовок + абзац о выгодах + список характеристик.\n"
+            "Ограничения: без превосходных степеней, без воды.\n"
+            "```\n\n"
+            "**Урок 2.2 — Где брать первые заказы**\n"
+            "• Kwork — проще всего получить первый заказ и отзыв\n"
+            "• FL.ru — заказчики с более крупным бюджетом\n"
+            "• Upwork / Fiverr — заказчики из-за рубежа, оплата в валюте\n"
+            "Сделайте 3–5 демо-кейсов заранее — портфолио решает.\n\n"
+            "**Урок 2.3 — Как не продешевить**\n"
+            "Клиент платит не за минуты работы, а за результат. Ориентируйтесь на цену "
+            "альтернативы без ИИ и ставьте на 30–50% ниже, поднимая цену с каждым отзывом."
+        ),
+        (
+            "**Модуль 3 — Конвейер контента**\n"
+            "Вторая модель заработка — не под заказ, а впрок: генерировать контент заранее "
+            "и продавать многократно.\n\n"
+            "**Урок 3.1 — Форматы, которые продаются**\n"
+            "ИИ-изображения для стоков, digital-продукты (планировщики, шаблоны), "
+            "короткие видео для Reels/Shorts пачками, тексты про запас (посты, рассылки).\n\n"
+            "**Урок 3.2 — От генерации до продажи**\n"
+            "• Adobe Stock — принимает ИИ-изображения при маркировке по их правилам\n"
+            "• Etsy — digital-товары: шаблоны, планировщики, принты\n"
+            "• Свой Telegram-канал — прямые продажи без комиссии площадки\n\n"
+            "**Урок 3.3 — Как поставить на автомат**\n"
+            "Ручная продажа в директ не масштабируется. Решение — автоворонка: комментарий с "
+            "кодовым словом в Instagram → сообщение в Direct → оплата в Telegram → выдача доступа. "
+            "Кстати, вы прямо сейчас находитесь внутри именно такой автоворонки — этот бот и есть "
+            "рабочий пример."
+        ),
+        (
+            "**Итог — набор на первую неделю**\n\n"
+            "✅ Выбрана ниша по чек-листу из урока 1.3\n"
+            "✅ Установлен один текстовый и один визуальный инструмент\n"
+            "✅ Собран каркас промпта под свою нишу\n"
+            "✅ Заведён профиль на Kwork или FL.ru с 3–5 демо-работами\n"
+            "✅ Выбран один формат для контента впрок\n\n"
+            "Курс не заканчивается на чтении — возвращайтесь к промптам из урока 2.1 при каждом "
+            "новом заказе и адаптируйте их под свою нишу."
+        ),
+    ]
+
+@dp.message(F.text == "📤 Опубликовать курс в канал")
+async def publish_course_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_channel_for_course_post)
+    await message.answer(
+        "Отправьте **юзернейм канала** (например `@my_channel`) или его **числовой ID** "
+        "(например `-1001234567890`) — бот должен быть добавлен туда администратором с правом "
+        "публиковать сообщения. Материалы курса «ИИ-Ремесло» уйдут туда серией постов.",
+        reply_markup=get_cancel_reply_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminStates.waiting_for_channel_for_course_post, F.text)
+async def process_publish_course_input(msg: types.Message, state: FSMContext):
+    chat_ref = msg.text.strip()
+    await state.clear()
+    posts = get_course_posts()
+    sent, failed = 0, 0
+    for text in posts:
+        try:
+            await bot.send_message(chat_id=chat_ref, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Не удалось опубликовать пост курса в {chat_ref} с Markdown: {e}")
+            try:
+                await bot.send_message(chat_id=chat_ref, text=text.replace("**", "").replace("```", ""))
+            except Exception as e2:
+                logging.error(f"Не удалось опубликовать пост курса в {chat_ref} даже без разметки: {e2}")
+                failed += 1
+                continue
+        sent += 1
+        await asyncio.sleep(1)  # не спамим Telegram API постами подряд
+
+    if failed:
+        await msg.answer(
+            f"⚠️ Опубликовано {sent} из {len(posts)} постов, {failed} не прошли.\n"
+            "Проверьте, что бот — админ канала с правом публикации, и что юзернейм/ID верны.",
+            reply_markup=get_admin_reply_kb()
+        )
+    else:
+        await msg.answer(
+            f"✅ Курс опубликован в канале — {sent} постов отправлено.",
+            reply_markup=get_admin_reply_kb()
+        )
+
 @dp.message(F.text == "💳 Токен ЮKassa")
 async def set_pay_token_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -829,6 +956,7 @@ async def process_price_input(msg: types.Message, state: FSMContext):
     AdminStates.waiting_for_course_link,
     AdminStates.waiting_for_course_price,
     AdminStates.waiting_for_channel_for_autolink,
+    AdminStates.waiting_for_channel_for_course_post,
 ))
 async def process_text_state_wrong_type(msg: types.Message):
     await msg.answer(
