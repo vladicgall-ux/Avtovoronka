@@ -12,7 +12,7 @@ from threading import Thread, Lock
 from flask import Flask, request, jsonify
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.types import (
     LabeledPrice, 
     PreCheckoutQuery, 
@@ -188,7 +188,7 @@ def get_setting(key: str) -> str:
     cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
     row = cursor.fetchone()
     conn.close()
-    return row["value"] if row else ""
+    return (row["value"] if row else "") or ""
 
 def set_setting(key: str, value: str):
     conn = get_db()
@@ -541,19 +541,27 @@ async def process_photo_input(msg: types.Message, state: FSMContext):
     await state.clear()
     await msg.answer("✅ Фото обложки успешно обновлено!", reply_markup=get_admin_reply_kb())
 
-@dp.message(AdminStates.waiting_for_course_start_msg)
+@dp.message(AdminStates.waiting_for_course_photo)
+async def process_photo_input_wrong_type(msg: types.Message):
+    await msg.answer(
+        "⚠️ Здесь нужно отправить именно фото (как изображение, не файлом). "
+        "Попробуйте ещё раз или нажмите «🔙 Отмена».",
+        reply_markup=get_cancel_reply_kb()
+    )
+
+@dp.message(AdminStates.waiting_for_course_start_msg, F.text)
 async def process_start_msg_input(msg: types.Message, state: FSMContext):
     set_setting("course_start_message", msg.text)
     await state.clear()
     await msg.answer("✅ Текст приветствия `/start` успешно обновлен!", reply_markup=get_admin_reply_kb())
 
-@dp.message(AdminStates.waiting_for_course_title)
+@dp.message(AdminStates.waiting_for_course_title, F.text)
 async def process_title_input(msg: types.Message, state: FSMContext):
     set_setting("course_title", msg.text.strip())
     await state.clear()
     await msg.answer(f"✅ Название курса изменено на: **{msg.text.strip()}**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
 
-@dp.message(AdminStates.waiting_for_page_token)
+@dp.message(AdminStates.waiting_for_page_token, F.text)
 async def process_page_token_input(msg: types.Message, state: FSMContext):
     raw_token = msg.text.strip()
     await state.clear()
@@ -587,19 +595,19 @@ async def process_page_token_input(msg: types.Message, state: FSMContext):
             reply_markup=get_admin_reply_kb()
         )
 
-@dp.message(AdminStates.waiting_for_trigger_word)
+@dp.message(AdminStates.waiting_for_trigger_word, F.text)
 async def process_trigger_input(msg: types.Message, state: FSMContext):
     set_setting("trigger_word", msg.text.strip().upper())
     await state.clear()
     await msg.answer(f"✅ Кодовое слово изменено на: **{msg.text.strip().upper()}**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
 
-@dp.message(AdminStates.waiting_for_dm_text)
+@dp.message(AdminStates.waiting_for_dm_text, F.text)
 async def process_dm_input(msg: types.Message, state: FSMContext):
     set_setting("dm_text", msg.text.strip())
     await state.clear()
     await msg.answer("✅ Текст сообщения в Direct (IG) обновлен!", reply_markup=get_admin_reply_kb())
 
-@dp.message(AdminStates.waiting_for_reply_comment_text)
+@dp.message(AdminStates.waiting_for_reply_comment_text, F.text)
 async def process_reply_comment_input(msg: types.Message, state: FSMContext):
     value = msg.text.strip()
     set_setting("reply_comment_text", "" if value == "-" else value)
@@ -609,7 +617,7 @@ async def process_reply_comment_input(msg: types.Message, state: FSMContext):
     else:
         await msg.answer("✅ Текст ответа под комментарием (IG) обновлен!", reply_markup=get_admin_reply_kb())
 
-@dp.message(AdminStates.waiting_for_verify_token)
+@dp.message(AdminStates.waiting_for_verify_token, F.text)
 async def process_verify_token_input(msg: types.Message, state: FSMContext):
     set_setting("verify_token", msg.text.strip())
     await state.clear()
@@ -619,19 +627,19 @@ async def process_verify_token_input(msg: types.Message, state: FSMContext):
         reply_markup=get_admin_reply_kb()
     )
 
-@dp.message(AdminStates.waiting_for_payment_token)
+@dp.message(AdminStates.waiting_for_payment_token, F.text)
 async def process_payment_tok_input(msg: types.Message, state: FSMContext):
     set_setting("payment_token", msg.text.strip())
     await state.clear()
     await msg.answer("✅ Токен ЮKassa сохранен!", reply_markup=get_admin_reply_kb())
 
-@dp.message(AdminStates.waiting_for_course_link)
+@dp.message(AdminStates.waiting_for_course_link, F.text)
 async def process_link_input(msg: types.Message, state: FSMContext):
     set_setting("course_link", msg.text.strip())
     await state.clear()
     await msg.answer("✅ Ссылка на канал сохранена!", reply_markup=get_admin_reply_kb())
 
-@dp.message(AdminStates.waiting_for_course_price)
+@dp.message(AdminStates.waiting_for_course_price, F.text)
 async def process_price_input(msg: types.Message, state: FSMContext):
     try:
         rubles = int(msg.text.strip())
@@ -640,6 +648,28 @@ async def process_price_input(msg: types.Message, state: FSMContext):
         await msg.answer(f"✅ Новая цена установлена: **{rubles} ₽**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
     except ValueError:
         await msg.answer("❌ Введите корректное число (только цифры).")
+
+# Если админ в режиме ввода текста прислал что-то другое (фото, стикер, голосовое) —
+# раньше это молча портило настройку (сохранялось пустое значение). Теперь просто просим
+# прислать текст, ничего не меняя.
+@dp.message(StateFilter(
+    AdminStates.waiting_for_course_start_msg,
+    AdminStates.waiting_for_course_title,
+    AdminStates.waiting_for_page_token,
+    AdminStates.waiting_for_trigger_word,
+    AdminStates.waiting_for_dm_text,
+    AdminStates.waiting_for_reply_comment_text,
+    AdminStates.waiting_for_verify_token,
+    AdminStates.waiting_for_payment_token,
+    AdminStates.waiting_for_course_link,
+    AdminStates.waiting_for_course_price,
+))
+async def process_text_state_wrong_type(msg: types.Message):
+    await msg.answer(
+        "⚠️ Здесь нужно текстовое сообщение, а не фото/файл/стикер/голосовое. "
+        "Отправьте текст ещё раз или нажмите «🔙 Отмена».",
+        reply_markup=get_cancel_reply_kb()
+    )
 
 # --- Оплата ЮKassa в Telegram ---
 @dp.callback_query(F.data == "buy_course")
