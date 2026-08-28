@@ -236,6 +236,7 @@ class AdminStates(StatesGroup):
     waiting_for_verify_token = State()
     waiting_for_payment_token = State()
     waiting_for_course_link = State()
+    waiting_for_channel_for_autolink = State()
     waiting_for_course_price = State()
     waiting_for_course_title = State()
     waiting_for_course_start_msg = State()
@@ -247,7 +248,8 @@ def get_admin_reply_kb():
         keyboard=[
             [KeyboardButton(text="📝 Текст приветствия"), KeyboardButton(text="🖼 Фото обложки")],
             [KeyboardButton(text="🏷 Название курса"), KeyboardButton(text="💰 Цена курса")],
-            [KeyboardButton(text="🔗 Ссылка на канал"), KeyboardButton(text="💳 Токен ЮKassa")],
+            [KeyboardButton(text="🔗 Ссылка на канал"), KeyboardButton(text="🪄 Автоссылка на канал")],
+            [KeyboardButton(text="💳 Токен ЮKassa")],
             [KeyboardButton(text="🎯 Кодовое слово IG"), KeyboardButton(text="✉️ Текст Direct (IG)")],
             [KeyboardButton(text="💬 Ответ под комментом (IG)"), KeyboardButton(text="🔐 Verify Token (IG)")],
             [KeyboardButton(text="🔑 Instagram Token"), KeyboardButton(text="📋 Текущие настройки")],
@@ -535,6 +537,45 @@ async def set_link_btn(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_course_link)
     await message.answer("Отправьте **ссылку на закрытый канал/материалы**:", reply_markup=get_cancel_reply_kb())
 
+@dp.message(F.text == "🪄 Автоссылка на канал")
+async def set_channel_autolink_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_channel_for_autolink)
+    await message.answer(
+        "Отправьте **юзернейм канала** (например `@my_channel`) или его **числовой ID** "
+        "(например `-1001234567890`) — бот должен уже быть добавлен в этот канал "
+        "администратором с правом «Приглашать пользователей по ссылке».\n\n"
+        "Если у канала нет юзернейма — узнать числовой ID можно, переслав любое "
+        "сообщение из канала боту `@userinfobot`.",
+        reply_markup=get_cancel_reply_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminStates.waiting_for_channel_for_autolink, F.text)
+async def process_channel_autolink_input(msg: types.Message, state: FSMContext):
+    chat_ref = msg.text.strip()
+    await state.clear()
+    try:
+        invite = await bot.create_chat_invite_link(chat_id=chat_ref, name="Автоворонка — доступ к курсу")
+        set_setting("course_link", invite.invite_link)
+        await msg.answer(
+            f"✅ Ссылка создана автоматически и сохранена как ссылка на курс:\n`{invite.invite_link}`",
+            reply_markup=get_admin_reply_kb(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"Не удалось создать ссылку-приглашение для {chat_ref}: {e}")
+        await msg.answer(
+            "❌ Не удалось создать ссылку. Проверьте:\n"
+            "1) бот добавлен в канал именно администратором;\n"
+            "2) у бота включено право «Приглашать пользователей по ссылке» (Invite Users via Link);\n"
+            "3) юзернейм/ID указан верно, с `@` или в формате `-100...`.\n\n"
+            f"Текст ошибки от Telegram: `{e}`",
+            reply_markup=get_admin_reply_kb(),
+            parse_mode="Markdown"
+        )
+
 @dp.message(F.text == "💳 Токен ЮKassa")
 async def set_pay_token_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -719,6 +760,7 @@ async def process_price_input(msg: types.Message, state: FSMContext):
     AdminStates.waiting_for_payment_token,
     AdminStates.waiting_for_course_link,
     AdminStates.waiting_for_course_price,
+    AdminStates.waiting_for_channel_for_autolink,
 ))
 async def process_text_state_wrong_type(msg: types.Message):
     await msg.answer(
