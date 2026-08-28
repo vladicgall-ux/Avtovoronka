@@ -1,0 +1,690 @@
+import os
+import asyncio
+import hmac
+import hashlib
+import logging
+import sqlite3
+import requests
+from collections import OrderedDict
+from threading import Thread, Lock
+from flask import Flask, request, jsonify
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    LabeledPrice, 
+    PreCheckoutQuery, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup, 
+    KeyboardButton, 
+    ReplyKeyboardRemove,
+    BotCommand,
+    BotCommandScopeChat
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Конфигурация ---
+TG_BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш Telegram ID
+PORT = int(os.getenv("PORT", 5000))
+IG_APP_SECRET = os.getenv("IG_APP_SECRET", "")  # App Secret из Meta для проверки подписи вебхука
+GRAPH_API_URL = "https://graph.facebook.com/v19.0"
+
+if not TG_BOT_TOKEN:
+    raise ValueError("Укажите BOT_TOKEN в переменных окружения!")
+
+if not ADMIN_ID:
+    raise ValueError(
+        "Укажите ADMIN_ID в переменных окружения! "
+        "Без него любой пользователь Telegram получит доступ к админ-панели."
+    )
+
+if not IG_APP_SECRET:
+    logging.warning(
+        "IG_APP_SECRET не задан — подпись входящих Instagram-вебхуков не проверяется. "
+        "Это небезопасно для продакшена: любой, кто узнает URL /webhook, "
+        "сможет присылать поддельные события от вашего имени."
+    )
+
+# --- Защита от повторной обработки одного и того же события Instagram ---
+# Meta повторяет доставку вебхука, если не получает 200 OK быстро — без дедупликации
+# один и тот же комментарий может вызвать несколько DM/ответов подряд.
+_PROCESSED_COMMENTS = OrderedDict()
+_PROCESSED_COMMENTS_LOCK = Lock()
+_PROCESSED_COMMENTS_MAX = 1000
+
+
+def _already_processed(comment_id: str) -> bool:
+    if not comment_id:
+        return False
+    with _PROCESSED_COMMENTS_LOCK:
+        if comment_id in _PROCESSED_COMMENTS:
+            return True
+        _PROCESSED_COMMENTS[comment_id] = True
+        if len(_PROCESSED_COMMENTS) > _PROCESSED_COMMENTS_MAX:
+            _PROCESSED_COMMENTS.popitem(last=False)
+        return False
+
+
+def verify_ig_signature(raw_body: bytes, signature_header: str) -> bool:
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(IG_APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    received = signature_header.split("sha256=", 1)[-1]
+    return hmac.compare_digest(expected, received)
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TG_BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+app = Flask(__name__)
+
+# --- База данных настроек (SQLite) ---
+def get_db():
+    conn = sqlite3.connect("bot_settings.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_seen TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            paid_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    default_start_msg = (
+        "👋 **Добро пожаловать!**\n\n"
+        "🚀 **Курс: Заработок на нейросетях и ИИ**\n\n"
+        "• 5 готовых схем заработка на нейросетях\n"
+        "• База рабочих промптов и связок\n"
+        "• Создание контента и автоворонок с нуля\n"
+        "• Доступ к закрытому Telegram-каналу и комьюнити\n\n"
+        "Нажмите кнопку ниже для безопасной оплаты через ЮKassa:"
+    )
+    defaults = {
+        "verify_token": "my_secret_token_123",
+        "page_access_token": "",
+        "trigger_word": "КУРС",
+        "dm_text": "Привет! 🚀 Твоя ссылка на курс со скидкой 50%:\n👉 https://t.me/YOUR_BOT?start=insta",
+        "reply_comment_text": "Ответили вам в Direct! 📥",
+        "course_title": "Курс: Заработок на нейросетях",
+        "course_description": "Полный доступ ко всем материалам курса и закрытому сообществу.",
+        "course_start_message": default_start_msg,
+        "course_photo_id": "",
+        "course_price": "299000",
+        "payment_token": "",
+        "course_link": "https://t.me/+YOUR_INVITE_LINK"
+    }
+    for k, v in defaults.items():
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+    conn.commit()
+    conn.close()
+
+def get_setting(key: str) -> str:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row["value"] if row else ""
+
+def set_setting(key: str, value: str):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+def record_user(user_id: int):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def record_purchase(user_id: int, amount: int):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO purchases (user_id, amount) VALUES (?, ?)", (user_id, amount))
+    conn.commit()
+    conn.close()
+
+def get_stats() -> dict:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) AS c FROM users")
+    users_count = cursor.fetchone()["c"]
+    cursor.execute("SELECT COUNT(*) AS c, COALESCE(SUM(amount), 0) AS s FROM purchases")
+    row = cursor.fetchone()
+    conn.close()
+    return {
+        "users_count": users_count,
+        "purchases_count": row["c"],
+        "revenue_kopecks": row["s"],
+    }
+
+init_db()
+
+# --- FSM Состояния ---
+class AdminStates(StatesGroup):
+    waiting_for_page_token = State()
+    waiting_for_trigger_word = State()
+    waiting_for_dm_text = State()
+    waiting_for_reply_comment_text = State()
+    waiting_for_verify_token = State()
+    waiting_for_payment_token = State()
+    waiting_for_course_link = State()
+    waiting_for_course_price = State()
+    waiting_for_course_title = State()
+    waiting_for_course_start_msg = State()
+    waiting_for_course_photo = State()
+
+# --- Постоянная клавиатура снизу (Reply Keyboard) для Админа ---
+def get_admin_reply_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📝 Текст приветствия"), KeyboardButton(text="🖼 Фото обложки")],
+            [KeyboardButton(text="🏷 Название курса"), KeyboardButton(text="💰 Цена курса")],
+            [KeyboardButton(text="🔗 Ссылка на канал"), KeyboardButton(text="💳 Токен ЮKassa")],
+            [KeyboardButton(text="🎯 Кодовое слово IG"), KeyboardButton(text="✉️ Текст Direct (IG)")],
+            [KeyboardButton(text="💬 Ответ под комментом (IG)"), KeyboardButton(text="🔐 Verify Token (IG)")],
+            [KeyboardButton(text="🔑 Instagram Token"), KeyboardButton(text="📋 Текущие настройки")],
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🗑 Удалить фото")],
+            [KeyboardButton(text="❌ Закрыть панель")]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+def get_cancel_reply_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🔙 Отмена")]],
+        resize_keyboard=True
+    )
+
+# --- Настройка кнопки Меню (Commands) слева снизу ---
+async def setup_bot_commands(bot: Bot):
+    # Общая команда для обычных пользователей
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🚀 Главное меню / Оплата")
+    ])
+
+    # Персональное меню для Админа (кнопка слева снизу)
+    if ADMIN_ID:
+        try:
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="admin", description="⚙️ Панель управления"),
+                    BotCommand(command="settings", description="📋 Посмотреть настройки"),
+                    BotCommand(command="start", description="🚀 Перезапуск / Вид клиента")
+                ],
+                scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+            )
+            logging.info(f"Персональное меню команд для ADMIN_ID ({ADMIN_ID}) успешно установлено.")
+        except Exception as e:
+            logging.error(f"Не удалось установить команды для админа: {e}")
+
+# --- Обработчик отмены ввода ---
+@dp.message(F.text == "🔙 Отмена")
+async def cancel_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=get_admin_reply_kb())
+
+# --- Клиентский запуск ---
+@dp.message(CommandStart())
+async def start_handler(message: types.Message):
+    record_user(message.from_user.id)
+    price = int(get_setting("course_price") or "299000")
+    rubles = price // 100
+    start_text = get_setting("course_start_message")
+    photo_id = get_setting("course_photo_id")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Купить ({rubles} ₽)", callback_data="buy_course")]
+        ]
+    )
+
+    if photo_id:
+        try:
+            await message.answer_photo(
+                photo=photo_id,
+                caption=start_text,
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
+            return
+        except Exception as e:
+            logging.error(f"Не удалось отправить фото: {e}")
+
+    await message.answer(
+        start_text,
+        reply_markup=kb,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
+# --- Команда /admin и /settings из меню слева ---
+@dp.message(Command("admin"))
+async def admin_command(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Доступ запрещен.")
+        return
+    await message.answer(
+        "⚙️ **Панель управления воронкой**\n\n"
+        "Кнопки управления открыты внизу экрана 👇\n"
+        "Также вы можете открывать команды через синюю кнопку **«Меню»** слева.",
+        reply_markup=get_admin_reply_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("settings"))
+async def settings_command(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await show_settings_text(message)
+
+# --- Обработчики кнопок нижней клавиатуры ---
+@dp.message(F.text == "❌ Закрыть панель")
+async def close_admin(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Панель с кнопками скрыта.\n\nЧтобы открыть её снова, нажмите синюю кнопку **«Меню»** в левом нижнем углу и выберите **⚙️ Панель управления**.",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.text == "📋 Текущие настройки")
+async def show_settings_text(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    token = get_setting("page_access_token")
+    hidden_token = f"{token[:10]}...{token[-5:]}" if len(token) > 15 else (token or "Не задан")
+    price = int(get_setting("course_price") or "299000") // 100
+    photo_status = "Установлено ✅" if get_setting("course_photo_id") else "Отсутствует (только текст) ❌"
+    
+    info = (
+        "📋 **Текущие настройки системы:**\n\n"
+        f"🏷 **Название курса:** {get_setting('course_title')}\n"
+        f"💰 **Цена:** {price} ₽\n"
+        f"🖼 **Фото обложки:** {photo_status}\n"
+        f"🔗 **Ссылка на канал:** `{get_setting('course_link')}`\n\n"
+        f"📝 **Текст /start:**\n---\n{get_setting('course_start_message')}\n---\n\n"
+        f"🎯 **Кодовое слово IG:** `{get_setting('trigger_word')}`\n"
+        f"✉️ **Текст в Direct (IG):**\n_{get_setting('dm_text')}_\n\n"
+        f"💬 **Ответ под комментарием (IG):**\n_{get_setting('reply_comment_text')}_\n\n"
+        f"🔐 **Verify Token (для настройки вебхука в Meta):**\n`{get_setting('verify_token')}`\n\n"
+        f"🔑 **Instagram Page Access Token:** `{hidden_token}`\n"
+        f"💳 **ЮKassa Token:** `{'Настроен' if get_setting('payment_token') else 'Не настроен'}`"
+    )
+    await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="Markdown", disable_web_page_preview=True)
+
+@dp.message(F.text == "📊 Статистика")
+async def show_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    stats = get_stats()
+    users_count = stats["users_count"]
+    purchases_count = stats["purchases_count"]
+    revenue = stats["revenue_kopecks"] // 100
+    conversion = (purchases_count / users_count * 100) if users_count else 0
+
+    info = (
+        "📊 **Статистика бота**\n\n"
+        f"👥 **Пользователей всего:** {users_count}\n"
+        f"💰 **Покупок:** {purchases_count}\n"
+        f"📈 **Конверсия в покупку:** {conversion:.1f}%\n"
+        f"💵 **Выручка (через ЮKassa):** {revenue} ₽"
+    )
+    await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+
+@dp.message(F.text == "📝 Текст приветствия")
+async def set_start_msg_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_course_start_msg)
+    await message.answer("Отправьте в чат новый **текст приветственного сообщения** (/start):", reply_markup=get_cancel_reply_kb(), parse_mode="Markdown")
+
+@dp.message(F.text == "🖼 Фото обложки")
+async def set_photo_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_course_photo)
+    await message.answer("📸 **Отправьте изображение в этот чат** (как обычное фото), и оно станет обложкой:", reply_markup=get_cancel_reply_kb())
+
+@dp.message(F.text == "🗑 Удалить фото")
+async def delete_photo_btn(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    set_setting("course_photo_id", "")
+    await message.answer("🗑 Фото удалено. Теперь бот будет отправлять только текстовое сообщение.", reply_markup=get_admin_reply_kb())
+
+@dp.message(F.text == "🏷 Название курса")
+async def set_title_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_course_title)
+    await message.answer("Отправьте **название курса/продукта**:", reply_markup=get_cancel_reply_kb())
+
+@dp.message(F.text == "💰 Цена курса")
+async def set_price_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_course_price)
+    await message.answer("Укажите цену курса в рублях (например: `2990`):", reply_markup=get_cancel_reply_kb())
+
+@dp.message(F.text == "🔗 Ссылка на канал")
+async def set_link_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_course_link)
+    await message.answer("Отправьте **ссылку на закрытый канал/материалы**:", reply_markup=get_cancel_reply_kb())
+
+@dp.message(F.text == "💳 Токен ЮKassa")
+async def set_pay_token_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_payment_token)
+    await message.answer("Отправьте **Payment Token** ЮKassa от BotFather:", reply_markup=get_cancel_reply_kb())
+
+@dp.message(F.text == "🎯 Кодовое слово IG")
+async def set_trigger_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_trigger_word)
+    await message.answer("Отправьте новое **кодовое слово** (например: КУРС):", reply_markup=get_cancel_reply_kb())
+
+@dp.message(F.text == "✉️ Текст Direct (IG)")
+async def set_dm_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_dm_text)
+    await message.answer(
+        "Отправьте новый **текст личного сообщения (Direct)**, "
+        "которое бот пришлёт пользователю Instagram по кодовому слову:",
+        reply_markup=get_cancel_reply_kb()
+    )
+
+@dp.message(F.text == "💬 Ответ под комментом (IG)")
+async def set_reply_comment_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_reply_comment_text)
+    await message.answer(
+        "Отправьте новый **текст публичного ответа под комментарием** в Instagram "
+        "(его увидят все, кто зайдёт на пост). Отправьте `-` (дефис), чтобы бот не отвечал под комментарием вообще:",
+        reply_markup=get_cancel_reply_kb()
+    )
+
+@dp.message(F.text == "🔐 Verify Token (IG)")
+async def set_verify_token_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_verify_token)
+    await message.answer(
+        "Отправьте новый **Verify Token**. Это произвольная строка (пароль), "
+        "которую нужно будет один в один указать в настройках вебхука в Meta for Developers:",
+        reply_markup=get_cancel_reply_kb()
+    )
+
+@dp.message(F.text == "🔑 Instagram Token")
+async def set_ig_token_btn(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_page_token)
+    await message.answer("Отправьте **Instagram Page Access Token** от Meta Developers:", reply_markup=get_cancel_reply_kb())
+
+# --- Обработка FSM ввода ---
+@dp.message(AdminStates.waiting_for_course_photo, F.photo)
+async def process_photo_input(msg: types.Message, state: FSMContext):
+    file_id = msg.photo[-1].file_id
+    set_setting("course_photo_id", file_id)
+    await state.clear()
+    await msg.answer("✅ Фото обложки успешно обновлено!", reply_markup=get_admin_reply_kb())
+
+@dp.message(AdminStates.waiting_for_course_start_msg)
+async def process_start_msg_input(msg: types.Message, state: FSMContext):
+    set_setting("course_start_message", msg.text)
+    await state.clear()
+    await msg.answer("✅ Текст приветствия `/start` успешно обновлен!", reply_markup=get_admin_reply_kb())
+
+@dp.message(AdminStates.waiting_for_course_title)
+async def process_title_input(msg: types.Message, state: FSMContext):
+    set_setting("course_title", msg.text.strip())
+    await state.clear()
+    await msg.answer(f"✅ Название курса изменено на: **{msg.text.strip()}**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+
+@dp.message(AdminStates.waiting_for_page_token)
+async def process_page_token_input(msg: types.Message, state: FSMContext):
+    set_setting("page_access_token", msg.text.strip())
+    await state.clear()
+    await msg.answer("✅ Instagram Access Token обновлен!", reply_markup=get_admin_reply_kb())
+
+@dp.message(AdminStates.waiting_for_trigger_word)
+async def process_trigger_input(msg: types.Message, state: FSMContext):
+    set_setting("trigger_word", msg.text.strip().upper())
+    await state.clear()
+    await msg.answer(f"✅ Кодовое слово изменено на: **{msg.text.strip().upper()}**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+
+@dp.message(AdminStates.waiting_for_dm_text)
+async def process_dm_input(msg: types.Message, state: FSMContext):
+    set_setting("dm_text", msg.text.strip())
+    await state.clear()
+    await msg.answer("✅ Текст сообщения в Direct (IG) обновлен!", reply_markup=get_admin_reply_kb())
+
+@dp.message(AdminStates.waiting_for_reply_comment_text)
+async def process_reply_comment_input(msg: types.Message, state: FSMContext):
+    value = msg.text.strip()
+    set_setting("reply_comment_text", "" if value == "-" else value)
+    await state.clear()
+    if value == "-":
+        await msg.answer("✅ Публичный ответ под комментарием отключен (бот будет только отправлять Direct).", reply_markup=get_admin_reply_kb())
+    else:
+        await msg.answer("✅ Текст ответа под комментарием (IG) обновлен!", reply_markup=get_admin_reply_kb())
+
+@dp.message(AdminStates.waiting_for_verify_token)
+async def process_verify_token_input(msg: types.Message, state: FSMContext):
+    set_setting("verify_token", msg.text.strip())
+    await state.clear()
+    await msg.answer(
+        "✅ Verify Token обновлен! Не забудьте указать точно такое же значение "
+        "в настройках вебхука вашего приложения в Meta for Developers.",
+        reply_markup=get_admin_reply_kb()
+    )
+
+@dp.message(AdminStates.waiting_for_payment_token)
+async def process_payment_tok_input(msg: types.Message, state: FSMContext):
+    set_setting("payment_token", msg.text.strip())
+    await state.clear()
+    await msg.answer("✅ Токен ЮKassa сохранен!", reply_markup=get_admin_reply_kb())
+
+@dp.message(AdminStates.waiting_for_course_link)
+async def process_link_input(msg: types.Message, state: FSMContext):
+    set_setting("course_link", msg.text.strip())
+    await state.clear()
+    await msg.answer("✅ Ссылка на канал сохранена!", reply_markup=get_admin_reply_kb())
+
+@dp.message(AdminStates.waiting_for_course_price)
+async def process_price_input(msg: types.Message, state: FSMContext):
+    try:
+        rubles = int(msg.text.strip())
+        set_setting("course_price", str(rubles * 100))
+        await state.clear()
+        await msg.answer(f"✅ Новая цена установлена: **{rubles} ₽**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+    except ValueError:
+        await msg.answer("❌ Введите корректное число (только цифры).")
+
+# --- Оплата ЮKassa в Telegram ---
+@dp.callback_query(F.data == "buy_course")
+async def send_invoice(callback: types.CallbackQuery):
+    p_token = get_setting("payment_token")
+    if not p_token:
+        await callback.message.answer("⚠️ Оплата временно недоступна (не настроен платежный токен).")
+        await callback.answer()
+        return
+
+    price = int(get_setting("course_price") or "299000")
+    title = get_setting("course_title") or "Курс по нейросетям"
+    desc = get_setting("course_description") or "Доступ к материалам и урокам"
+
+    try:
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=title,
+            description=desc,
+            payload="custom_course_payload",
+            provider_token=p_token,
+            currency="RUB",
+            prices=[LabeledPrice(label=title, amount=price)],
+            start_parameter="course-buy"
+        )
+    except Exception as e:
+        logging.error(f"Не удалось создать счет на оплату: {e}")
+        await callback.message.answer(
+            "⚠️ Не удалось создать счет на оплату. Проверьте платежный токен ЮKassa в настройках "
+            "или попробуйте позже."
+        )
+    await callback.answer()
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: types.Message):
+    record_purchase(message.from_user.id, message.successful_payment.total_amount)
+    link = get_setting("course_link")
+    await message.answer(
+        f"🎉 **Оплата прошла успешно!**\n\n"
+        f"Ваша персональная ссылка на материалы курса:\n👉 [Перейти к обучению]({link})\n\n"
+        f"Приятного изучения!",
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
+# --- Сервер Flask (Вебхук Instagram) ---
+@app.route("/", methods=["GET"])
+def index():
+    return "All-in-One Telegram + Instagram Engine is Live!", 200
+
+@app.route("/webhook", methods=["GET"])
+def verify_fb_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    expected_token = get_setting("verify_token")
+
+    if mode == "subscribe" and token == expected_token:
+        return challenge, 200
+    return "Verification failed", 403
+
+@app.route("/webhook", methods=["POST"])
+def fb_webhook_event():
+    # Проверка подписи запроса — защищает от поддельных вебхуков от кого угодно,
+    # кто узнал публичный URL /webhook.
+    if IG_APP_SECRET:
+        signature_header = request.headers.get("X-Hub-Signature-256", "")
+        if not verify_ig_signature(request.get_data(), signature_header):
+            logging.warning("Отклонён webhook-запрос с неверной подписью X-Hub-Signature-256.")
+            return "Invalid signature", 403
+
+    data = request.get_json(silent=True) or {}
+    if data.get("object") != "instagram":
+        return "Not an instagram event", 404
+
+    page_token = get_setting("page_access_token")
+    trigger = get_setting("trigger_word").upper()
+    dm_message = get_setting("dm_text")
+    reply_comment = get_setting("reply_comment_text")
+
+    if not page_token:
+        logging.warning("Получено событие Instagram, но page_access_token не настроен — игнорирую.")
+        return jsonify({"status": "ok"}), 200
+
+    for entry in data.get("entry", []):
+        for change in entry.get("changes", []):
+            if change.get("field") != "comments":
+                continue
+
+            val = change.get("value", {})
+            text = val.get("text", "") or ""
+            comment_id = val.get("id")
+            user_id = val.get("from", {}).get("id")
+
+            # Защита от повторной обработки одного и того же комментария
+            # (Meta может присылать событие повторно, если ответ 200 задержался).
+            if _already_processed(comment_id):
+                continue
+
+            # Защита от "эха": собственный ответ бота под комментарием тоже приходит
+            # как новое событие comments и не должен запускать бота повторно.
+            if reply_comment and text.strip() == reply_comment.strip():
+                continue
+
+            if not user_id or trigger not in text.upper():
+                continue
+
+            try:
+                resp = requests.post(
+                    f"{GRAPH_API_URL}/me/messages",
+                    params={"access_token": page_token},
+                    json={"recipient": {"id": user_id}, "message": {"text": dm_message}},
+                    timeout=10
+                )
+                if not resp.ok:
+                    logging.error(f"Instagram DM не отправлен: {resp.status_code} {resp.text}")
+            except requests.RequestException as e:
+                logging.error(f"Ошибка отправки Instagram DM: {e}")
+
+            if reply_comment and comment_id:
+                try:
+                    resp = requests.post(
+                        f"{GRAPH_API_URL}/{comment_id}/replies",
+                        params={"access_token": page_token, "message": reply_comment},
+                        timeout=10
+                    )
+                    if not resp.ok:
+                        logging.error(f"Ответ на комментарий не отправлен: {resp.status_code} {resp.text}")
+                except requests.RequestException as e:
+                    logging.error(f"Ошибка ответа на комментарий Instagram: {e}")
+
+    return jsonify({"status": "ok"}), 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
+
+async def main():
+    # Настраиваем меню команд слева внизу
+    await setup_bot_commands(bot)
+
+    # Запуск Flask сервера в отдельном потоке
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logging.info(f"Flask Webhook Server запущен на порту {PORT}")
+
+    # Запуск Telegram бота
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
