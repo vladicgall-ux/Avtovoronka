@@ -276,14 +276,26 @@ async def start_handler(message: types.Message):
             )
             return
         except Exception as e:
-            logging.error(f"Не удалось отправить фото: {e}")
+            # Либо не удалось отправить само фото, либо текст приветствия сломал
+            # Markdown-разметку (непарный символ * или _) — пробуем без форматирования,
+            # чтобы покупатель в любом случае увидел кнопку оплаты.
+            logging.error(f"Не удалось отправить фото с приветствием: {e}")
+            try:
+                await message.answer_photo(photo=photo_id, caption=start_text, reply_markup=kb)
+                return
+            except Exception as e2:
+                logging.error(f"Не удалось отправить фото даже без форматирования: {e2}")
 
-    await message.answer(
-        start_text,
-        reply_markup=kb,
-        parse_mode="Markdown",
-        disable_web_page_preview=True
-    )
+    try:
+        await message.answer(
+            start_text,
+            reply_markup=kb,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить приветствие с Markdown-разметкой: {e}")
+        await message.answer(start_text, reply_markup=kb, disable_web_page_preview=True)
 
 # --- Команда /admin и /settings из меню слева ---
 @dp.message(Command("admin"))
@@ -338,7 +350,15 @@ async def show_settings_text(message: types.Message):
         f"🔑 **Instagram Page Access Token:** `{hidden_token}`\n"
         f"💳 **ЮKassa Token:** `{'Настроен' if get_setting('payment_token') else 'Не настроен'}`"
     )
-    await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="Markdown", disable_web_page_preview=True)
+    try:
+        await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        # Один из сохранённых текстов мог сломать Markdown-разметку (например, непарный
+        # символ * или _) — отправляем без форматирования, чтобы админ в любом случае
+        # увидел настройки, а не тишину.
+        logging.error(f"Не удалось отправить настройки с Markdown-разметкой: {e}")
+        plain_info = info.replace("**", "").replace("`", "").replace("_", "")
+        await message.answer(plain_info, reply_markup=get_admin_reply_kb(), disable_web_page_preview=True)
 
 @dp.message(F.text == "📊 Статистика")
 async def show_stats(message: types.Message):
@@ -575,13 +595,26 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 async def successful_payment(message: types.Message):
     record_purchase(message.from_user.id, message.successful_payment.total_amount)
     link = get_setting("course_link")
-    await message.answer(
+
+    # Ссылку в кликабельный Markdown-формат [текст](url) оборачиваем только если это
+    # похоже на настоящий URL — иначе (например, если админ по ошибке ввёл "@username"
+    # вместо "https://t.me/username") просто показываем её текстом, чтобы её можно было
+    # хотя бы скопировать, а не терять сообщение целиком из-за ошибки разметки.
+    if link.startswith("http://") or link.startswith("https://") or link.startswith("tg://"):
+        link_line = f"👉 [Перейти к обучению]({link})"
+    else:
+        link_line = f"👉 {link}" if link else "👉 (ссылка не настроена — обратитесь к администратору)"
+
+    text = (
         f"🎉 **Оплата прошла успешно!**\n\n"
-        f"Ваша персональная ссылка на материалы курса:\n👉 [Перейти к обучению]({link})\n\n"
-        f"Приятного изучения!",
-        parse_mode="Markdown",
-        disable_web_page_preview=True
+        f"Ваша персональная ссылка на материалы курса:\n{link_line}\n\n"
+        f"Приятного изучения!"
     )
+    try:
+        await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение об оплате с Markdown-разметкой: {e}")
+        await message.answer(text.replace("**", ""), disable_web_page_preview=True)
 
 # --- Сервер Flask (Вебхук Instagram) ---
 @app.route("/", methods=["GET"])
