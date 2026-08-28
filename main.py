@@ -163,7 +163,7 @@ def init_db():
         "Нажмите кнопку ниже для безопасной оплаты через ЮKassa:"
     )
     defaults = {
-        "verify_token": "my_secret_token_123",
+        "verify_token": "0000",
         "page_access_token": "",
         "trigger_word": "КУРС",
         "dm_text": "Привет! 🚀 Твоя ссылка на курс со скидкой 50%:\n👉 https://t.me/YOUR_BOT?start=insta",
@@ -459,7 +459,9 @@ async def send_setup_instructions(message: types.Message):
         "**3. Укажите в настройках вебхука:**\n"
         "• Callback URL: `https://ВАШ_ДОМЕН/webhook`\n"
         f"• Verify Token: `{verify_token}`\n"
-        "(это значение уже настроено в боте — просто скопируйте и вставьте его в Meta)\n\n"
+        "(по умолчанию в боте стоит `0000` — просто скопируйте текущее значение выше и "
+        "вставьте его в Meta один в один; при желании смените его кнопкой "
+        "**🔐 Verify Token (IG)**)\n\n"
         "**4. Подпишитесь на поле** `comments`.\n\n"
         "**5. App Secret и App ID**\n"
         "Settings → Basic → скопируйте **App Secret** и **App ID**, укажите их в переменных "
