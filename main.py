@@ -252,7 +252,7 @@ def get_admin_reply_kb():
             [KeyboardButton(text="💬 Ответ под комментом (IG)"), KeyboardButton(text="🔐 Verify Token (IG)")],
             [KeyboardButton(text="🔑 Instagram Token"), KeyboardButton(text="📋 Текущие настройки")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🗑 Удалить фото")],
-            [KeyboardButton(text="❌ Закрыть панель")]
+            [KeyboardButton(text="📖 Инструкция"), KeyboardButton(text="❌ Закрыть панель")]
         ],
         resize_keyboard=True,
         is_persistent=True
@@ -436,6 +436,56 @@ async def show_stats(message: types.Message):
         f"💵 **Выручка (через ЮKassa):** {revenue} ₽"
     )
     await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+
+@dp.message(F.text == "📖 Инструкция")
+async def show_instructions(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    verify_token = get_setting("verify_token") or "(не задан)"
+
+    part1 = (
+        "📖 **Инструкция: настройка Instagram (Meta Graph API)**\n\n"
+        "**1. Создайте приложение**\n"
+        "developers.facebook.com/apps → тип **Business**.\n\n"
+        "**2. Добавьте продукт Webhooks**\n"
+        "В приложении: **Добавить продукты → Webhooks → Настроить**, объект **Instagram**.\n\n"
+        "**3. Укажите в настройках вебхука:**\n"
+        "• Callback URL: `https://ВАШ_ДОМЕН/webhook`\n"
+        f"• Verify Token: `{verify_token}`\n"
+        "(это значение уже настроено в боте — просто скопируйте и вставьте его в Meta)\n\n"
+        "**4. Подпишитесь на поле** `comments`.\n\n"
+        "**5. App Secret и App ID**\n"
+        "Settings → Basic → скопируйте **App Secret** и **App ID**, укажите их в переменных "
+        "окружения хостинга как `IG_APP_SECRET` и `IG_APP_ID` (нужны для проверки подписи "
+        "вебхуков и автопродления токена)."
+    )
+
+    part2 = (
+        "**6. Получите Page Access Token**\n"
+        "Через Graph API Explorer, для страницы, привязанной к вашему Instagram, с правами:\n"
+        "`instagram_basic`, `instagram_manage_comments`, `instagram_manage_messages`, "
+        "`pages_show_list`, `pages_messaging`.\n"
+        "Вставьте его кнопкой **🔑 Instagram Token** — бот сам продлит его и будет "
+        "поддерживать актуальным (если заданы `IG_APP_ID`/`IG_APP_SECRET`).\n\n"
+        "**7. Оплата (ЮKassa через Telegram)**\n"
+        "`@BotFather` → `/mybots` → выбрать бота → **Payments** → выбрать провайдера ЮKassa "
+        "(для теста — «ЮKassa (RUB) TEST»). Полученный provider_token вставьте кнопкой "
+        "**💳 Токен ЮKassa**.\n\n"
+        "**8. Остальные настройки** — название и цена курса, ссылка на канал (`https://t.me/...`), "
+        "текст приветствия, кодовое слово и тексты для Instagram — всё меняется кнопками ниже, "
+        "без перезапуска бота.\n\n"
+        "Текущее состояние всех настроек — кнопка **📋 Текущие настройки**."
+    )
+
+    for text in (part1, part2):
+        try:
+            await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            logging.error(f"Не удалось отправить инструкцию с Markdown-разметкой: {e}")
+            await message.answer(text.replace("**", "").replace("`", ""), disable_web_page_preview=True)
+
+    await message.answer("Готово 👆", reply_markup=get_admin_reply_kb())
 
 @dp.message(F.text == "📝 Текст приветствия")
 async def set_start_msg_btn(message: types.Message, state: FSMContext):
