@@ -41,6 +41,26 @@ GRAPH_API_URL = "https://graph.facebook.com/v19.0"
 TOKEN_RENEW_CHECK_INTERVAL = 24 * 3600  # проверяем раз в сутки
 TOKEN_RENEW_THRESHOLD = 5 * 86400  # продлеваем, если до истечения осталось меньше 5 дней
 
+# --- Хранилище настроек ---
+# Если задан DATABASE_URL — используем внешний Postgres (переживает рестарт/редеплой
+# на любом хостинге). Если нет — локальный SQLite-файл по пути DB_PATH (переживает
+# рестарт только если хостинг даёт постоянный диск и DB_PATH указывает именно на него).
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = bool(DATABASE_URL)
+DB_PATH = os.getenv("DB_PATH", "bot_settings.db")
+
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
+else:
+    logging.warning(
+        "DATABASE_URL не задан — настройки хранятся в локальном SQLite-файле "
+        f"'{DB_PATH}'. Если хостинг пересоздаёт файловую систему при каждом "
+        "рестарте/редеплое, все настройки и статистика будут сбрасываться. "
+        "Чтобы это исправить — подключите бесплатный Postgres (например Neon.tech "
+        "или Supabase) и укажите его адрес в переменной DATABASE_URL."
+    )
+
 if not TG_BOT_TOKEN:
     raise ValueError("Укажите BOT_TOKEN в переменных окружения!")
 
@@ -126,33 +146,58 @@ app = Flask(__name__)
 
 # --- База данных настроек (SQLite) ---
 def get_db():
-    conn = sqlite3.connect("bot_settings.db")
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        return conn
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            first_seen TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS purchases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            paid_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
+    if USE_POSTGRES:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS purchases (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount INTEGER NOT NULL,
+                paid_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+    else:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                paid_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
     default_start_msg = (
         "👋 **Добро пожаловать!**\n\n"
         "🚀 **Курс: Заработок на нейросетях и ИИ**\n\n"
@@ -178,14 +223,20 @@ def init_db():
         "course_link": "https://t.me/+YOUR_INVITE_LINK"
     }
     for k, v in defaults.items():
-        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+        if USE_POSTGRES:
+            cursor.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
+                (k, v)
+            )
+        else:
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
     conn.commit()
     conn.close()
 
 def get_setting(key: str) -> str:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    cursor.execute(f"SELECT value FROM settings WHERE key = {'%s' if USE_POSTGRES else '?'}", (key,))
     row = cursor.fetchone()
     conn.close()
     return (row["value"] if row else "") or ""
@@ -193,21 +244,34 @@ def get_setting(key: str) -> str:
 def set_setting(key: str, value: str):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    if USE_POSTGRES:
+        cursor.execute(
+            "INSERT INTO settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (key, value)
+        )
+    else:
+        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
     conn.commit()
     conn.close()
 
 def record_user(user_id: int):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    if USE_POSTGRES:
+        cursor.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+    else:
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
     conn.close()
 
 def record_purchase(user_id: int, amount: int):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO purchases (user_id, amount) VALUES (?, ?)", (user_id, amount))
+    if USE_POSTGRES:
+        cursor.execute("INSERT INTO purchases (user_id, amount) VALUES (%s, %s)", (user_id, amount))
+    else:
+        cursor.execute("INSERT INTO purchases (user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     conn.close()
 
@@ -485,6 +549,10 @@ async def send_setup_instructions(message: types.Message):
         "**8. Остальные настройки** — название и цена курса, ссылка на канал (`https://t.me/...`), "
         "текст приветствия, кодовое слово и тексты для Instagram — всё меняется кнопками ниже, "
         "без перезапуска бота.\n\n"
+        "**9. Важно про хранение данных.** Если переменная `DATABASE_URL` не задана, все "
+        "настройки хранятся в локальном файле и могут слетать при рестарте хостинга. "
+        "Подключите бесплатный Postgres (Neon.tech/Supabase) и укажите его в `DATABASE_URL` — "
+        "подробности в README проекта.\n\n"
         "Текущее состояние всех настроек — кнопка **📋 Текущие настройки**."
     )
 
