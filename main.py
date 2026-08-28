@@ -345,12 +345,15 @@ async def admin_command(message: types.Message):
         await message.answer("⛔️ Доступ запрещен.")
         return
     await message.answer(
-        "⚙️ **Панель управления воронкой**\n\n"
-        "Кнопки управления открыты внизу экрана 👇\n"
-        "Также вы можете открывать команды через синюю кнопку **«Меню»** слева.",
+        "👋 **Добро пожаловать, администратор!**\n\n"
+        "⚙️ Панель управления воронкой открыта — кнопки внизу экрана 👇\n"
+        "Также вы можете открывать команды через синюю кнопку **«Меню»** слева.\n\n"
+        "Ниже сразу пришлю инструкцию по настройке — актуальна и при первом запуске, "
+        "и как справочник на будущее (её же можно вызвать кнопкой **📖 Инструкция**).",
         reply_markup=get_admin_reply_kb(),
         parse_mode="Markdown"
     )
+    await send_setup_instructions(message)
 
 @dp.message(Command("settings"))
 async def settings_command(message: types.Message):
@@ -441,7 +444,10 @@ async def show_stats(message: types.Message):
 async def show_instructions(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
+    await send_setup_instructions(message)
+    await message.answer("Готово 👆", reply_markup=get_admin_reply_kb())
 
+async def send_setup_instructions(message: types.Message):
     verify_token = get_setting("verify_token") or "(не задан)"
 
     part1 = (
@@ -484,8 +490,6 @@ async def show_instructions(message: types.Message):
         except Exception as e:
             logging.error(f"Не удалось отправить инструкцию с Markdown-разметкой: {e}")
             await message.answer(text.replace("**", "").replace("`", ""), disable_web_page_preview=True)
-
-    await message.answer("Готово 👆", reply_markup=get_admin_reply_kb())
 
 @dp.message(F.text == "📝 Текст приветствия")
 async def set_start_msg_btn(message: types.Message, state: FSMContext):
