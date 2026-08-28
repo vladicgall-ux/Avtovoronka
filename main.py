@@ -1,10 +1,12 @@
 import os
+import time
 import asyncio
 import hmac
 import hashlib
 import logging
 import sqlite3
 import requests
+from datetime import datetime
 from collections import OrderedDict
 from threading import Thread, Lock
 from flask import Flask, request, jsonify
@@ -34,7 +36,10 @@ TG_BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш Telegram ID
 PORT = int(os.getenv("PORT", 5000))
 IG_APP_SECRET = os.getenv("IG_APP_SECRET", "")  # App Secret из Meta для проверки подписи вебхука
+IG_APP_ID = os.getenv("IG_APP_ID", "")  # App ID из Meta — нужен для автопродления Instagram-токена
 GRAPH_API_URL = "https://graph.facebook.com/v19.0"
+TOKEN_RENEW_CHECK_INTERVAL = 24 * 3600  # проверяем раз в сутки
+TOKEN_RENEW_THRESHOLD = 5 * 86400  # продлеваем, если до истечения осталось меньше 5 дней
 
 if not TG_BOT_TOKEN:
     raise ValueError("Укажите BOT_TOKEN в переменных окружения!")
@@ -50,6 +55,12 @@ if not IG_APP_SECRET:
         "IG_APP_SECRET не задан — подпись входящих Instagram-вебхуков не проверяется. "
         "Это небезопасно для продакшена: любой, кто узнает URL /webhook, "
         "сможет присылать поддельные события от вашего имени."
+    )
+
+if not IG_APP_ID or not IG_APP_SECRET:
+    logging.warning(
+        "IG_APP_ID и/или IG_APP_SECRET не заданы — автопродление Instagram Access Token "
+        "работать не будет, токен придётся обновлять вручную в Meta for Developers."
     )
 
 # --- Защита от повторной обработки одного и того же события Instagram ---
@@ -78,6 +89,35 @@ def verify_ig_signature(raw_body: bytes, signature_header: str) -> bool:
     expected = hmac.new(IG_APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     received = signature_header.split("sha256=", 1)[-1]
     return hmac.compare_digest(expected, received)
+
+
+def exchange_for_long_lived_token(short_lived_token: str):
+    """Обменивает короткоживущий Instagram/Facebook токен на долгоживущий (обычно ~60 дней).
+    Возвращает (новый_токен, срок_действия_в_секундах) или None, если обмен не удался."""
+    if not IG_APP_ID or not IG_APP_SECRET:
+        return None
+    try:
+        resp = requests.get(
+            f"{GRAPH_API_URL}/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": IG_APP_ID,
+                "client_secret": IG_APP_SECRET,
+                "fb_exchange_token": short_lived_token,
+            },
+            timeout=10,
+        )
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logging.error(f"Ошибка запроса продления Instagram-токена: {e}")
+        return None
+
+    if not resp.ok or "access_token" not in data:
+        logging.error(f"Не удалось продлить Instagram-токен: {data}")
+        return None
+
+    expires_in = data.get("expires_in") or (60 * 86400)
+    return data["access_token"], int(expires_in)
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TG_BOT_TOKEN)
@@ -128,6 +168,7 @@ def init_db():
         "trigger_word": "КУРС",
         "dm_text": "Привет! 🚀 Твоя ссылка на курс со скидкой 50%:\n👉 https://t.me/YOUR_BOT?start=insta",
         "reply_comment_text": "Ответили вам в Direct! 📥",
+        "page_access_token_expires_at": "",
         "course_title": "Курс: Заработок на нейросетях",
         "course_description": "Полный доступ ко всем материалам курса и закрытому сообществу.",
         "course_start_message": default_start_msg,
@@ -333,6 +374,22 @@ async def show_settings_text(message: types.Message):
         return
     token = get_setting("page_access_token")
     hidden_token = f"{token[:10]}...{token[-5:]}" if len(token) > 15 else (token or "Не задан")
+
+    expires_at = get_setting("page_access_token_expires_at")
+    if not token:
+        token_status_line = ""
+    elif expires_at:
+        try:
+            expires_dt = datetime.fromtimestamp(int(expires_at))
+            days_left = (int(expires_at) - int(time.time())) // 86400
+            token_status_line = f"⏳ **Токен истекает:** {expires_dt.strftime('%d.%m.%Y')} (~{days_left} дн., продлевается автоматически)\n"
+        except (ValueError, OSError):
+            token_status_line = ""
+    elif IG_APP_ID and IG_APP_SECRET:
+        token_status_line = "⏳ **Токен истекает:** неизвестно — введите токен заново, чтобы включить автопродление\n"
+    else:
+        token_status_line = "⏳ **Токен истекает:** автопродление выключено (нет IG_APP_ID/IG_APP_SECRET)\n"
+
     price = int(get_setting("course_price") or "299000") // 100
     photo_status = "Установлено ✅" if get_setting("course_photo_id") else "Отсутствует (только текст) ❌"
     
@@ -348,6 +405,7 @@ async def show_settings_text(message: types.Message):
         f"💬 **Ответ под комментарием (IG):**\n_{get_setting('reply_comment_text')}_\n\n"
         f"🔐 **Verify Token (для настройки вебхука в Meta):**\n`{get_setting('verify_token')}`\n\n"
         f"🔑 **Instagram Page Access Token:** `{hidden_token}`\n"
+        f"{token_status_line}"
         f"💳 **ЮKassa Token:** `{'Настроен' if get_setting('payment_token') else 'Не настроен'}`"
     )
     try:
@@ -497,9 +555,37 @@ async def process_title_input(msg: types.Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_page_token)
 async def process_page_token_input(msg: types.Message, state: FSMContext):
-    set_setting("page_access_token", msg.text.strip())
+    raw_token = msg.text.strip()
     await state.clear()
-    await msg.answer("✅ Instagram Access Token обновлен!", reply_markup=get_admin_reply_kb())
+
+    result = exchange_for_long_lived_token(raw_token)
+    if result:
+        long_token, expires_in = result
+        set_setting("page_access_token", long_token)
+        set_setting("page_access_token_expires_at", str(int(time.time()) + expires_in))
+        days = expires_in // 86400
+        await msg.answer(
+            f"✅ Instagram Access Token сохранён и автоматически продлён "
+            f"(действует ещё ~{days} дн.). Дальше бот будет продлевать его сам, "
+            f"пока не истечёт полностью.",
+            reply_markup=get_admin_reply_kb()
+        )
+        return
+
+    set_setting("page_access_token", raw_token)
+    set_setting("page_access_token_expires_at", "")
+    if IG_APP_ID and IG_APP_SECRET:
+        await msg.answer(
+            "⚠️ Токен сохранён, но автоматически продлить его не удалось (Meta вернула ошибку — "
+            "возможно, токен уже недействителен). Автопродление подключится, когда вставите рабочий токен.",
+            reply_markup=get_admin_reply_kb()
+        )
+    else:
+        await msg.answer(
+            "✅ Instagram Access Token обновлен! ⚠️ Автопродление не работает — не заданы "
+            "переменные окружения IG_APP_ID/IG_APP_SECRET, токен придётся обновлять вручную.",
+            reply_markup=get_admin_reply_kb()
+        )
 
 @dp.message(AdminStates.waiting_for_trigger_word)
 async def process_trigger_input(msg: types.Message, state: FSMContext):
@@ -707,6 +793,41 @@ def fb_webhook_event():
 def run_flask():
     app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
 
+async def token_renewal_loop():
+    """Раз в сутки проверяет срок действия Instagram-токена и продлевает его заранее,
+    если до истечения осталось меньше TOKEN_RENEW_THRESHOLD секунд."""
+    while True:
+        await asyncio.sleep(TOKEN_RENEW_CHECK_INTERVAL)
+        try:
+            token = get_setting("page_access_token")
+            expires_at = get_setting("page_access_token_expires_at")
+            if not token or not expires_at or not (IG_APP_ID and IG_APP_SECRET):
+                continue
+
+            remaining = int(expires_at) - int(time.time())
+            if remaining > TOKEN_RENEW_THRESHOLD:
+                continue
+
+            result = exchange_for_long_lived_token(token)
+            if result:
+                new_token, expires_in = result
+                set_setting("page_access_token", new_token)
+                set_setting("page_access_token_expires_at", str(int(time.time()) + expires_in))
+                logging.info(f"Instagram Access Token автоматически продлён ещё на {expires_in // 86400} дн.")
+            else:
+                logging.error("Не удалось автоматически продлить Instagram Access Token.")
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        "⚠️ Не удалось автоматически продлить Instagram Access Token — "
+                        "похоже, он уже недействителен. Получите новый в Meta for Developers "
+                        "и обновите его кнопкой «🔑 Instagram Token» в /admin."
+                    )
+                except Exception as notify_err:
+                    logging.error(f"Не удалось уведомить админа о просроченном токене: {notify_err}")
+        except Exception as e:
+            logging.error(f"Ошибка в фоновой задаче автопродления Instagram-токена: {e}")
+
 async def main():
     # Настраиваем меню команд слева внизу
     await setup_bot_commands(bot)
@@ -715,6 +836,9 @@ async def main():
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logging.info(f"Flask Webhook Server запущен на порту {PORT}")
+
+    # Фоновая задача автопродления Instagram-токена
+    asyncio.create_task(token_renewal_loop())
 
     # Запуск Telegram бота
     await dp.start_polling(bot)
