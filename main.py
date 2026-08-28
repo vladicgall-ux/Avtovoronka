@@ -223,6 +223,8 @@ def init_db():
         "dm_text": "Привет! 🚀 Твоя ссылка на курс со скидкой 50%:\n👉 https://t.me/YOUR_BOT?start=insta",
         "reply_comment_text": "Ответили вам в Direct! 📥",
         "page_access_token_expires_at": "",
+        "telegraph_access_token": "",
+        "course_telegraph_url": "",
         "course_title": "Курс: Заработок на нейросетях",
         "course_description": "Полный доступ ко всем материалам курса и закрытому сообществу.",
         "course_start_message": default_start_msg,
@@ -323,7 +325,8 @@ def get_admin_reply_kb():
             [KeyboardButton(text="📝 Текст приветствия"), KeyboardButton(text="🖼 Фото обложки")],
             [KeyboardButton(text="🏷 Название курса"), KeyboardButton(text="💰 Цена курса")],
             [KeyboardButton(text="🔗 Ссылка на канал"), KeyboardButton(text="🪄 Автоссылка на канал")],
-            [KeyboardButton(text="📤 Опубликовать курс в канал"), KeyboardButton(text="💳 Токен ЮKassa")],
+            [KeyboardButton(text="📤 Опубликовать курс в канал"), KeyboardButton(text="📰 Страница курса (Telegra.ph)")],
+            [KeyboardButton(text="💳 Токен ЮKassa")],
             [KeyboardButton(text="🎯 Кодовое слово IG"), KeyboardButton(text="✉️ Текст Direct (IG)")],
             [KeyboardButton(text="💬 Ответ под комментом (IG)"), KeyboardButton(text="🔐 Verify Token (IG)")],
             [KeyboardButton(text="🔑 Instagram Token"), KeyboardButton(text="📋 Текущие настройки")],
@@ -755,6 +758,167 @@ def get_course_posts() -> list:
             "новом заказе и адаптируйте их под свою нишу."
         ),
     ]
+
+# --- Telegra.ph: отдельная веб-страница курса с текстом и фото ---
+TELEGRAPH_API_URL = "https://api.telegra.ph"
+
+
+def get_or_create_telegraph_token() -> str:
+    token = get_setting("telegraph_access_token")
+    if token:
+        return token
+    try:
+        resp = requests.post(
+            f"{TELEGRAPH_API_URL}/createAccount",
+            data={"short_name": "AI-Remeslo", "author_name": "ИИ-Ремесло"},
+            timeout=10,
+        )
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logging.error(f"Не удалось создать аккаунт Telegra.ph: {e}")
+        return ""
+    if not data.get("ok"):
+        logging.error(f"Telegra.ph createAccount вернул ошибку: {data}")
+        return ""
+    token = data["result"]["access_token"]
+    set_setting("telegraph_access_token", token)
+    return token
+
+
+def upload_image_to_telegraph(image_path: str) -> str:
+    """Загружает картинку на Telegra.ph и возвращает её полный URL (или '' при ошибке)."""
+    try:
+        with open(image_path, "rb") as f:
+            resp = requests.post(
+                "https://telegra.ph/upload",
+                files={"file": (os.path.basename(image_path), f, "image/png")},
+                timeout=20,
+            )
+        data = resp.json()
+    except (OSError, requests.RequestException, ValueError) as e:
+        logging.error(f"Ошибка загрузки картинки {image_path} в Telegra.ph: {e}")
+        return ""
+    if isinstance(data, list) and data and "src" in data[0]:
+        return f"https://telegra.ph{data[0]['src']}"
+    logging.error(f"Telegra.ph upload вернул неожиданный ответ для {image_path}: {data}")
+    return ""
+
+
+def _parse_inline_bold(line: str) -> list:
+    """Разбивает строку с <b>...</b> на список узлов Telegra.ph (строки + {tag: b})."""
+    parts = []
+    idx = 0
+    for m in re.finditer(r"<b>(.*?)</b>", line):
+        if m.start() > idx:
+            parts.append(line[idx:m.start()])
+        parts.append({"tag": "b", "children": [m.group(1)]})
+        idx = m.end()
+    if idx < len(line):
+        parts.append(line[idx:])
+    return parts or [""]
+
+
+def _plain_block_to_paragraph_node(block: str) -> dict:
+    lines = block.split("\n")
+    children = []
+    for i, line in enumerate(lines):
+        if i > 0:
+            children.append({"tag": "br"})
+        children.extend(_parse_inline_bold(line))
+    return {"tag": "p", "children": children}
+
+
+def _text_block_to_telegraph_nodes(block: str) -> list:
+    """Блок может содержать текст и/или один <pre>...</pre> — код должен стать
+    отдельным узлом pre, а не просто текстом внутри параграфа."""
+    match = re.search(r"<pre>(.*?)</pre>", block, re.DOTALL)
+    if not match:
+        return [_plain_block_to_paragraph_node(block)]
+
+    nodes = []
+    before = block[:match.start()].strip("\n")
+    after = block[match.end():].strip("\n")
+    if before:
+        nodes.append(_plain_block_to_paragraph_node(before))
+    nodes.append({"tag": "pre", "children": [match.group(1)]})
+    if after:
+        nodes.append(_plain_block_to_paragraph_node(after))
+    return nodes
+
+
+def build_course_telegraph_nodes() -> list:
+    """Собирает содержимое курса (те же посты, что уходят в канал) в формат Node
+    для Telegra.ph, с загрузкой тех же обложек-картинок."""
+    nodes = []
+    for image_name, text in get_course_posts():
+        if image_name:
+            image_path = os.path.join(COURSE_ASSETS_DIR, image_name)
+            if os.path.exists(image_path):
+                img_url = upload_image_to_telegraph(image_path)
+                if img_url:
+                    nodes.append({"tag": "figure", "children": [{"tag": "img", "attrs": {"src": img_url}}]})
+        blocks = [b for b in text.split("\n\n") if b.strip()]
+        for b in blocks:
+            nodes.extend(_text_block_to_telegraph_nodes(b))
+    return nodes
+
+
+def create_telegraph_page(title: str, author_name: str, nodes: list) -> str:
+    token = get_or_create_telegraph_token()
+    if not token:
+        return ""
+    try:
+        resp = requests.post(
+            f"{TELEGRAPH_API_URL}/createPage",
+            json={
+                "access_token": token,
+                "title": title,
+                "author_name": author_name,
+                "content": nodes,
+                "return_content": False,
+            },
+            timeout=15,
+        )
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logging.error(f"Ошибка создания страницы Telegra.ph: {e}")
+        return ""
+    if not data.get("ok"):
+        logging.error(f"Telegra.ph createPage вернул ошибку: {data}")
+        return ""
+    return data["result"]["url"]
+
+
+@dp.message(F.text == "📰 Страница курса (Telegra.ph)")
+async def create_course_telegraph_btn(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("⏳ Создаю страницу курса на Telegra.ph, подождите немного…")
+
+    nodes = build_course_telegraph_nodes()
+    url = create_telegraph_page("ИИ-Ремесло — курс: заработок на нейросетях", "ИИ-Ремесло", nodes)
+
+    if not url:
+        await message.answer(
+            "❌ Не удалось создать страницу на Telegra.ph. Попробуйте ещё раз чуть позже — "
+            "если не поможет, посмотрите «Логи работы» в bothost сразу после попытки, там будет "
+            "точная причина.",
+            reply_markup=get_admin_reply_kb()
+        )
+        return
+
+    set_setting("course_telegraph_url", url)
+    try:
+        await message.answer(
+            f"✅ Страница создана:\n{html.escape(url)}\n\n"
+            "Отправьте эту ссылку отдельным сообщением в канал/группу — Telegram сам покажет "
+            "красивое превью, и по клику откроется страница курса с текстом и фото.",
+            reply_markup=get_admin_reply_kb(),
+            disable_web_page_preview=False
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить ссылку на Telegra.ph: {e}")
+        await message.answer(f"✅ Страница создана: {url}", reply_markup=get_admin_reply_kb())
 
 @dp.message(F.text == "📤 Опубликовать курс в канал")
 async def publish_course_btn(message: types.Message, state: FSMContext):
