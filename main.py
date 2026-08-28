@@ -1,5 +1,7 @@
 import os
+import re
 import time
+import html
 import asyncio
 import hmac
 import hashlib
@@ -111,6 +113,11 @@ def verify_ig_signature(raw_body: bytes, signature_header: str) -> bool:
     return hmac.compare_digest(expected, received)
 
 
+def strip_html(text: str) -> str:
+    """Запасной вариант на случай сбоя HTML-разметки — убирает теги, оставляя текст читаемым."""
+    return re.sub(r"<[^>]+>", "", text)
+
+
 def exchange_for_long_lived_token(short_lived_token: str):
     """Обменивает короткоживущий Instagram/Facebook токен на долгоживущий (обычно ~60 дней).
     Возвращает (новый_токен, срок_действия_в_секундах) или None, если обмен не удался."""
@@ -199,8 +206,8 @@ def init_db():
             )
         """)
     default_start_msg = (
-        "👋 **Добро пожаловать!**\n\n"
-        "🚀 **Курс: Заработок на нейросетях и ИИ**\n\n"
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "🚀 <b>Курс: Заработок на нейросетях и ИИ</b>\n\n"
         "• 5 готовых схем заработка на нейросетях\n"
         "• База рабочих промптов и связок\n"
         "• Создание контента и автоворонок с нуля\n"
@@ -380,16 +387,16 @@ async def start_handler(message: types.Message):
                 photo=photo_id,
                 caption=start_text,
                 reply_markup=kb,
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             return
         except Exception as e:
             # Либо не удалось отправить само фото, либо текст приветствия сломал
-            # Markdown-разметку (непарный символ * или _) — пробуем без форматирования,
+            # HTML-разметку (незакрытый тег) — пробуем без форматирования,
             # чтобы покупатель в любом случае увидел кнопку оплаты.
             logging.error(f"Не удалось отправить фото с приветствием: {e}")
             try:
-                await message.answer_photo(photo=photo_id, caption=start_text, reply_markup=kb)
+                await message.answer_photo(photo=photo_id, caption=strip_html(start_text), reply_markup=kb)
                 return
             except Exception as e2:
                 logging.error(f"Не удалось отправить фото даже без форматирования: {e2}")
@@ -398,12 +405,12 @@ async def start_handler(message: types.Message):
         await message.answer(
             start_text,
             reply_markup=kb,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             disable_web_page_preview=True
         )
     except Exception as e:
-        logging.error(f"Не удалось отправить приветствие с Markdown-разметкой: {e}")
-        await message.answer(start_text, reply_markup=kb, disable_web_page_preview=True)
+        logging.error(f"Не удалось отправить приветствие с HTML-разметкой: {e}")
+        await message.answer(strip_html(start_text), reply_markup=kb, disable_web_page_preview=True)
 
 # --- Команда /admin и /settings из меню слева ---
 @dp.message(Command("admin"))
@@ -411,15 +418,22 @@ async def admin_command(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔️ Доступ запрещен.")
         return
-    await message.answer(
-        "👋 **Добро пожаловать, администратор!**\n\n"
-        "⚙️ Панель управления воронкой открыта — кнопки внизу экрана 👇\n"
-        "Также вы можете открывать команды через синюю кнопку **«Меню»** слева.\n\n"
-        "Ниже сразу пришлю инструкцию по настройке — актуальна и при первом запуске, "
-        "и как справочник на будущее (её же можно вызвать кнопкой **📖 Инструкция**).",
-        reply_markup=get_admin_reply_kb(),
-        parse_mode="Markdown"
-    )
+    try:
+        await message.answer(
+            "👋 <b>Добро пожаловать, администратор!</b>\n\n"
+            "⚙️ Панель управления воронкой открыта — кнопки внизу экрана 👇\n"
+            "Также вы можете открывать команды через синюю кнопку «Меню» слева.\n\n"
+            "Ниже сразу пришлю инструкцию по настройке — актуальна и при первом запуске, "
+            "и как справочник на будущее (её же можно вызвать кнопкой <b>📖 Инструкция</b>).",
+            reply_markup=get_admin_reply_kb(),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить приветствие админа с HTML-разметкой: {e}")
+        await message.answer(
+            "👋 Добро пожаловать, администратор! Панель управления открыта — кнопки внизу.",
+            reply_markup=get_admin_reply_kb()
+        )
     await send_setup_instructions(message)
 
 @dp.message(Command("settings"))
@@ -433,9 +447,9 @@ async def settings_command(message: types.Message):
 async def close_admin(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Панель с кнопками скрыта.\n\nЧтобы открыть её снова, нажмите синюю кнопку **«Меню»** в левом нижнем углу и выберите **⚙️ Панель управления**.",
+        "Панель с кнопками скрыта.\n\nЧтобы открыть её снова, нажмите синюю кнопку «Меню» в левом нижнем углу и выберите <b>⚙️ Панель управления</b>.",
         reply_markup=ReplyKeyboardRemove(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "📋 Текущие настройки")
@@ -452,41 +466,41 @@ async def show_settings_text(message: types.Message):
         try:
             expires_dt = datetime.fromtimestamp(int(expires_at))
             days_left = (int(expires_at) - int(time.time())) // 86400
-            token_status_line = f"⏳ **Токен истекает:** {expires_dt.strftime('%d.%m.%Y')} (~{days_left} дн., продлевается автоматически)\n"
+            token_status_line = f"⏳ <b>Токен истекает:</b> {expires_dt.strftime('%d.%m.%Y')} (~{days_left} дн., продлевается автоматически)\n"
         except (ValueError, OSError):
             token_status_line = ""
     elif IG_APP_ID and IG_APP_SECRET:
-        token_status_line = "⏳ **Токен истекает:** неизвестно — введите токен заново, чтобы включить автопродление\n"
+        token_status_line = "⏳ <b>Токен истекает:</b> неизвестно — введите токен заново, чтобы включить автопродление\n"
     else:
-        token_status_line = "⏳ **Токен истекает:** автопродление выключено (нет IG_APP_ID/IG_APP_SECRET)\n"
+        token_status_line = "⏳ <b>Токен истекает:</b> автопродление выключено (нет IG_APP_ID/IG_APP_SECRET)\n"
 
     price = int(get_setting("course_price") or "299000") // 100
     photo_status = "Установлено ✅" if get_setting("course_photo_id") else "Отсутствует (только текст) ❌"
-    
+
+    # Все значения ниже — свободный текст, который вводит админ (или который приходит
+    # из Instagram/Meta), поэтому обязательно экранируем перед вставкой в HTML-разметку —
+    # иначе случайный символ <, > или & в тексте сломает всё сообщение.
+    e = html.escape
     info = (
-        "📋 **Текущие настройки системы:**\n\n"
-        f"🏷 **Название курса:** {get_setting('course_title')}\n"
-        f"💰 **Цена:** {price} ₽\n"
-        f"🖼 **Фото обложки:** {photo_status}\n"
-        f"🔗 **Ссылка на канал:** `{get_setting('course_link')}`\n\n"
-        f"📝 **Текст /start:**\n---\n{get_setting('course_start_message')}\n---\n\n"
-        f"🎯 **Кодовое слово IG:** `{get_setting('trigger_word')}`\n"
-        f"✉️ **Текст в Direct (IG):**\n_{get_setting('dm_text')}_\n\n"
-        f"💬 **Ответ под комментарием (IG):**\n_{get_setting('reply_comment_text')}_\n\n"
-        f"🔐 **Verify Token (для настройки вебхука в Meta):**\n`{get_setting('verify_token')}`\n\n"
-        f"🔑 **Instagram Page Access Token:** `{hidden_token}`\n"
+        "📋 <b>Текущие настройки системы:</b>\n\n"
+        f"🏷 <b>Название курса:</b> {e(get_setting('course_title'))}\n"
+        f"💰 <b>Цена:</b> {price} ₽\n"
+        f"🖼 <b>Фото обложки:</b> {photo_status}\n"
+        f"🔗 <b>Ссылка на канал:</b> <code>{e(get_setting('course_link'))}</code>\n\n"
+        f"📝 <b>Текст /start:</b>\n---\n{e(get_setting('course_start_message'))}\n---\n\n"
+        f"🎯 <b>Кодовое слово IG:</b> <code>{e(get_setting('trigger_word'))}</code>\n"
+        f"✉️ <b>Текст в Direct (IG):</b>\n<i>{e(get_setting('dm_text'))}</i>\n\n"
+        f"💬 <b>Ответ под комментарием (IG):</b>\n<i>{e(get_setting('reply_comment_text'))}</i>\n\n"
+        f"🔐 <b>Verify Token (для настройки вебхука в Meta):</b>\n<code>{e(get_setting('verify_token'))}</code>\n\n"
+        f"🔑 <b>Instagram Page Access Token:</b> <code>{e(hidden_token)}</code>\n"
         f"{token_status_line}"
-        f"💳 **ЮKassa Token:** `{'Настроен' if get_setting('payment_token') else 'Не настроен'}`"
+        f"💳 <b>ЮKassa Token:</b> <code>{'Настроен' if get_setting('payment_token') else 'Не настроен'}</code>"
     )
     try:
-        await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        # Один из сохранённых текстов мог сломать Markdown-разметку (например, непарный
-        # символ * или _) — отправляем без форматирования, чтобы админ в любом случае
-        # увидел настройки, а не тишину.
-        logging.error(f"Не удалось отправить настройки с Markdown-разметкой: {e}")
-        plain_info = info.replace("**", "").replace("`", "").replace("_", "")
-        await message.answer(plain_info, reply_markup=get_admin_reply_kb(), disable_web_page_preview=True)
+        await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as ex:
+        logging.error(f"Не удалось отправить настройки с HTML-разметкой: {ex}")
+        await message.answer(strip_html(info), reply_markup=get_admin_reply_kb(), disable_web_page_preview=True)
 
 @dp.message(F.text == "📊 Статистика")
 async def show_stats(message: types.Message):
@@ -499,13 +513,17 @@ async def show_stats(message: types.Message):
     conversion = (purchases_count / users_count * 100) if users_count else 0
 
     info = (
-        "📊 **Статистика бота**\n\n"
-        f"👥 **Пользователей всего:** {users_count}\n"
-        f"💰 **Покупок:** {purchases_count}\n"
-        f"📈 **Конверсия в покупку:** {conversion:.1f}%\n"
-        f"💵 **Выручка (через ЮKassa):** {revenue} ₽"
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👥 <b>Пользователей всего:</b> {users_count}\n"
+        f"💰 <b>Покупок:</b> {purchases_count}\n"
+        f"📈 <b>Конверсия в покупку:</b> {conversion:.1f}%\n"
+        f"💵 <b>Выручка (через ЮKassa):</b> {revenue} ₽"
     )
-    await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+    try:
+        await message.answer(info, reply_markup=get_admin_reply_kb(), parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Не удалось отправить статистику с HTML-разметкой: {e}")
+        await message.answer(strip_html(info), reply_markup=get_admin_reply_kb())
 
 @dp.message(F.text == "📖 Инструкция")
 async def show_instructions(message: types.Message):
@@ -515,68 +533,75 @@ async def show_instructions(message: types.Message):
     await message.answer("Готово 👆", reply_markup=get_admin_reply_kb())
 
 async def send_setup_instructions(message: types.Message):
-    verify_token = get_setting("verify_token") or "(не задан)"
+    verify_token = html.escape(get_setting("verify_token") or "(не задан)")
 
     part1 = (
-        "📖 **Инструкция: настройка Instagram (Meta Graph API)**\n\n"
-        "**1. Создайте приложение**\n"
-        "developers.facebook.com/apps → тип **Business**.\n\n"
-        "**2. Добавьте продукт Webhooks**\n"
-        "В приложении: **Добавить продукты → Webhooks → Настроить**, объект **Instagram**.\n\n"
-        "**3. Укажите в настройках вебхука:**\n"
-        "• Callback URL: `https://ВАШ_ДОМЕН/webhook`\n"
-        f"• Verify Token: `{verify_token}`\n"
-        "(по умолчанию в боте стоит `0000` — просто скопируйте текущее значение выше и "
-        "вставьте его в Meta один в один; при желании смените его кнопкой "
-        "**🔐 Verify Token (IG)**)\n\n"
-        "**4. Подпишитесь на поле** `comments`.\n\n"
-        "**5. App Secret и App ID**\n"
-        "Settings → Basic → скопируйте **App Secret** и **App ID**, укажите их в переменных "
-        "окружения хостинга как `IG_APP_SECRET` и `IG_APP_ID` (нужны для проверки подписи "
-        "вебхуков и автопродления токена)."
+        "📖 <b>Инструкция: настройка Instagram (Meta Graph API)</b>\n\n"
+        "<b>1. Создайте приложение</b>\n"
+        "developers.facebook.com/apps → тип <b>Business</b>.\n\n"
+        "<b>2. Добавьте продукт Webhooks</b>\n"
+        "В приложении: <b>Добавить продукты → Webhooks → Настроить</b>, объект <b>Instagram</b>.\n\n"
+        "<b>3. Укажите в настройках вебхука:</b>\n"
+        "• Callback URL: <code>https://ВАШ_ДОМЕН/webhook</code>\n"
+        f"• Verify Token: <code>{verify_token}</code>\n"
+        "(по умолчанию в боте стоит <code>0000</code> — просто скопируйте текущее значение выше "
+        "и вставьте его в Meta один в один; при желании смените его кнопкой "
+        "<b>🔐 Verify Token (IG)</b>)\n\n"
+        "<b>4. Подпишитесь на поле</b> <code>comments</code>.\n\n"
+        "<b>5. App Secret и App ID</b>\n"
+        "Settings → Basic → скопируйте <b>App Secret</b> и <b>App ID</b>, укажите их в переменных "
+        "окружения хостинга как <code>IG_APP_SECRET</code> и <code>IG_APP_ID</code> (нужны для "
+        "проверки подписи вебхуков и автопродления токена)."
     )
 
     part2 = (
-        "**6. Получите Page Access Token**\n"
+        "<b>6. Получите Page Access Token</b>\n"
         "Через Graph API Explorer, для страницы, привязанной к вашему Instagram, с правами:\n"
-        "`instagram_basic`, `instagram_manage_comments`, `instagram_manage_messages`, "
-        "`pages_show_list`, `pages_messaging`.\n"
-        "Вставьте его кнопкой **🔑 Instagram Token** — бот сам продлит его и будет "
-        "поддерживать актуальным (если заданы `IG_APP_ID`/`IG_APP_SECRET`).\n\n"
-        "**7. Оплата (ЮKassa через Telegram)**\n"
-        "`@BotFather` → `/mybots` → выбрать бота → **Payments** → выбрать провайдера ЮKassa "
-        "(для теста — «ЮKassa (RUB) TEST»). Полученный provider_token вставьте кнопкой "
-        "**💳 Токен ЮKassa**.\n\n"
-        "**8. Остальные настройки** — название и цена курса, ссылка на канал (`https://t.me/...`), "
-        "текст приветствия, кодовое слово и тексты для Instagram — всё меняется кнопками ниже, "
-        "без перезапуска бота.\n\n"
-        "**9. Важно про хранение данных.** Если переменная `DATABASE_URL` не задана, все "
-        "настройки хранятся в локальном файле и могут слетать при рестарте хостинга. "
-        "Подключите бесплатный Postgres (Neon.tech/Supabase) и укажите его в `DATABASE_URL` — "
-        "подробности в README проекта.\n\n"
-        "Текущее состояние всех настроек — кнопка **📋 Текущие настройки**."
+        "<code>instagram_basic</code>, <code>instagram_manage_comments</code>, "
+        "<code>instagram_manage_messages</code>, <code>pages_show_list</code>, "
+        "<code>pages_messaging</code>.\n"
+        "Вставьте его кнопкой <b>🔑 Instagram Token</b> — бот сам продлит его и будет "
+        "поддерживать актуальным (если заданы <code>IG_APP_ID</code>/<code>IG_APP_SECRET</code>).\n\n"
+        "<b>7. Оплата (ЮKassa через Telegram)</b>\n"
+        "<code>@BotFather</code> → <code>/mybots</code> → выбрать бота → <b>Payments</b> → выбрать "
+        "провайдера ЮKassa (для теста — «ЮKassa (RUB) TEST»). Полученный provider_token вставьте "
+        "кнопкой <b>💳 Токен ЮKassa</b>.\n\n"
+        "<b>8. Остальные настройки</b> — название и цена курса, ссылка на канал "
+        "(<code>https://t.me/...</code>), текст приветствия, кодовое слово и тексты для Instagram — "
+        "всё меняется кнопками ниже, без перезапуска бота.\n\n"
+        "<b>9. Важно про хранение данных.</b> Если переменная <code>DATABASE_URL</code> не задана, "
+        "все настройки хранятся в локальном файле и могут слетать при рестарте хостинга. "
+        "Подключите бесплатный Postgres (Neon.tech/Supabase) и укажите его в "
+        "<code>DATABASE_URL</code> — подробности в README проекта.\n\n"
+        "Текущее состояние всех настроек — кнопка <b>📋 Текущие настройки</b>."
     )
 
     for text in (part1, part2):
         try:
-            await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+            await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
-            logging.error(f"Не удалось отправить инструкцию с Markdown-разметкой: {e}")
-            await message.answer(text.replace("**", "").replace("`", ""), disable_web_page_preview=True)
+            logging.error(f"Не удалось отправить инструкцию с HTML-разметкой: {e}")
+            await message.answer(strip_html(text), disable_web_page_preview=True)
 
 @dp.message(F.text == "📝 Текст приветствия")
 async def set_start_msg_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_course_start_msg)
-    await message.answer("Отправьте в чат новый **текст приветственного сообщения** (/start):", reply_markup=get_cancel_reply_kb(), parse_mode="Markdown")
+    await message.answer(
+        "Отправьте в чат новый <b>текст приветственного сообщения</b> (/start). "
+        "Для форматирования используйте HTML-теги: <code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
+        "<code>&lt;i&gt;курсив&lt;/i&gt;</code> — обычный текст можно писать как есть.",
+        reply_markup=get_cancel_reply_kb(),
+        parse_mode="HTML"
+    )
 
 @dp.message(F.text == "🖼 Фото обложки")
 async def set_photo_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_course_photo)
-    await message.answer("📸 **Отправьте изображение в этот чат** (как обычное фото), и оно станет обложкой:", reply_markup=get_cancel_reply_kb())
+    await message.answer("📸 <b>Отправьте изображение в этот чат</b> (как обычное фото), и оно станет обложкой:", reply_markup=get_cancel_reply_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "🗑 Удалить фото")
 async def delete_photo_btn(message: types.Message):
@@ -590,21 +615,21 @@ async def set_title_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_course_title)
-    await message.answer("Отправьте **название курса/продукта**:", reply_markup=get_cancel_reply_kb())
+    await message.answer("Отправьте <b>название курса/продукта</b>:", reply_markup=get_cancel_reply_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "💰 Цена курса")
 async def set_price_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_course_price)
-    await message.answer("Укажите цену курса в рублях (например: `2990`):", reply_markup=get_cancel_reply_kb())
+    await message.answer("Укажите цену курса в рублях (например: <code>2990</code>):", reply_markup=get_cancel_reply_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "🔗 Ссылка на канал")
 async def set_link_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_course_link)
-    await message.answer("Отправьте **ссылку на закрытый канал/материалы**:", reply_markup=get_cancel_reply_kb())
+    await message.answer("Отправьте <b>ссылку на закрытый канал/материалы</b>:", reply_markup=get_cancel_reply_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "🪄 Автоссылка на канал")
 async def set_channel_autolink_btn(message: types.Message, state: FSMContext):
@@ -612,13 +637,13 @@ async def set_channel_autolink_btn(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_for_channel_for_autolink)
     await message.answer(
-        "Отправьте **юзернейм канала** (например `@my_channel`) или его **числовой ID** "
-        "(например `-1001234567890`) — бот должен уже быть добавлен в этот канал "
-        "администратором с правом «Приглашать пользователей по ссылке».\n\n"
+        "Отправьте <b>юзернейм канала</b> (например <code>@my_channel</code>) или его "
+        "<b>числовой ID</b> (например <code>-1001234567890</code>) — бот должен уже быть "
+        "добавлен в этот канал администратором с правом «Приглашать пользователей по ссылке».\n\n"
         "Если у канала нет юзернейма — узнать числовой ID можно, переслав любое "
-        "сообщение из канала боту `@userinfobot`.",
+        "сообщение из канала боту <code>@userinfobot</code>.",
         reply_markup=get_cancel_reply_kb(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminStates.waiting_for_channel_for_autolink, F.text)
@@ -629,9 +654,9 @@ async def process_channel_autolink_input(msg: types.Message, state: FSMContext):
         invite = await bot.create_chat_invite_link(chat_id=chat_ref, name="Автоворонка — доступ к курсу")
         set_setting("course_link", invite.invite_link)
         await msg.answer(
-            f"✅ Ссылка создана автоматически и сохранена как ссылка на курс:\n`{invite.invite_link}`",
+            f"✅ Ссылка создана автоматически и сохранена как ссылка на курс:\n<code>{html.escape(invite.invite_link)}</code>",
             reply_markup=get_admin_reply_kb(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e:
         logging.error(f"Не удалось создать ссылку-приглашение для {chat_ref}: {e}")
@@ -639,83 +664,81 @@ async def process_channel_autolink_input(msg: types.Message, state: FSMContext):
             "❌ Не удалось создать ссылку. Проверьте:\n"
             "1) бот добавлен в канал именно администратором;\n"
             "2) у бота включено право «Приглашать пользователей по ссылке» (Invite Users via Link);\n"
-            "3) юзернейм/ID указан верно, с `@` или в формате `-100...`.\n\n"
-            f"Текст ошибки от Telegram: `{e}`",
+            "3) юзернейм/ID указан верно, с <code>@</code> или в формате <code>-100...</code>.\n\n"
+            f"Текст ошибки от Telegram: <code>{html.escape(str(e))}</code>",
             reply_markup=get_admin_reply_kb(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
 def get_course_posts() -> list:
     """Материалы курса «ИИ-Ремесло», разбитые на посты для канала."""
     return [
         (
-            "🪶 **ИИ-Ремесло**\n"
+            "🪶 <b>ИИ-Ремесло</b>\n"
             "Курс: заработок на нейросетях и ИИ\n\n"
             "3 модуля, 9 уроков — без воды. Дальше по порядку пойдут посты с материалами."
         ),
         (
-            "**Модуль 1 — Карта возможностей**\n"
+            "<b>Модуль 1 — Карта возможностей</b>\n"
             "Прежде чем выбирать инструмент, стоит понять сам рынок.\n\n"
-            "**Урок 1.1 — Четыре модели заработка на нейросетях**\n"
+            "<b>Урок 1.1 — Четыре модели заработка на нейросетях</b>\n"
             "1) Услуги на фрилансе — вы выполняете задачи заказчика с помощью нейросетей быстрее и дешевле.\n"
             "2) Продажа готового контента — генерируете заранее и продаёте многократно.\n"
             "3) Автоматизация под ключ — собираете рабочие связки (боты, воронки) для бизнеса.\n"
             "4) Обучение и консалтинг — учите других тому, что уже освоили сами.\n"
             "Начинать разумнее с 1 и 2 — низкий порог входа, быстрая обратная связь от рынка.\n\n"
-            "**Урок 1.2 — Инструменты для старта**\n"
+            "<b>Урок 1.2 — Инструменты для старта</b>\n"
             "• ChatGPT / Claude — тексты, структура, код\n"
             "• Midjourney — изображения высокого качества\n"
             "• ElevenLabs — синтез и клонирование голоса\n"
             "• CapCut — быстрый монтаж коротких видео\n\n"
-            "**Урок 1.3 — Как выбрать нишу за вечер**\n"
+            "<b>Урок 1.3 — Как выбрать нишу за вечер</b>\n"
             "Отметьте для себя: делали что-то похожее руками? готовы показывать результат публично? "
             "видите минимум трёх конкурентов, которые на этом зарабатывают? можете показать первый "
             "результат за 1–2 дня? Ниша с наибольшим числом «да» — та, с которой стоит начинать."
         ),
         (
-            "**Модуль 2 — Ремесло формулировок**\n"
+            "<b>Модуль 2 — Ремесло формулировок</b>\n"
             "Промпт-инжиниринг — это навык точно формулировать задачу, и он продаётся так же, "
             "как копирайтинг или дизайн.\n\n"
-            "**Урок 2.1 — Анатомия рабочего промпта**\n"
+            "<b>Урок 2.1 — Анатомия рабочего промпта</b>\n"
             "Пять частей: Роль (кем выступает нейросеть) → Контекст (для кого и зачем) → "
             "Задача (что именно сделать) → Формат (в каком виде нужен ответ) → Ограничения "
             "(чего избегать).\n\n"
             "Пример каркаса:\n"
-            "```\n"
-            "Роль: ты — опытный копирайтер маркетплейсов.\n"
+            "<pre>Роль: ты — опытный копирайтер маркетплейсов.\n"
             "Контекст: карточка товара, ниша — детские рюкзаки.\n"
             "Задача: продающее описание из трёх абзацев.\n"
             "Формат: заголовок + абзац о выгодах + список характеристик.\n"
-            "Ограничения: без превосходных степеней, без воды.\n"
-            "```\n\n"
-            "**Урок 2.2 — Где брать первые заказы**\n"
+            "Ограничения: без превосходных степеней, без воды.</pre>\n\n"
+            "<b>Урок 2.2 — Где брать первые заказы</b>\n"
             "• Kwork — проще всего получить первый заказ и отзыв\n"
             "• FL.ru — заказчики с более крупным бюджетом\n"
             "• Upwork / Fiverr — заказчики из-за рубежа, оплата в валюте\n"
             "Сделайте 3–5 демо-кейсов заранее — портфолио решает.\n\n"
-            "**Урок 2.3 — Как не продешевить**\n"
+            "<b>Урок 2.3 — Как не продешевить</b>\n"
             "Клиент платит не за минуты работы, а за результат. Ориентируйтесь на цену "
             "альтернативы без ИИ и ставьте на 30–50% ниже, поднимая цену с каждым отзывом."
         ),
         (
-            "**Модуль 3 — Конвейер контента**\n"
+            "<b>Модуль 3 — Конвейер контента</b>\n"
             "Вторая модель заработка — не под заказ, а впрок: генерировать контент заранее "
             "и продавать многократно.\n\n"
-            "**Урок 3.1 — Форматы, которые продаются**\n"
+            "<b>Урок 3.1 — Форматы, которые продаются</b>\n"
             "ИИ-изображения для стоков, digital-продукты (планировщики, шаблоны), "
             "короткие видео для Reels/Shorts пачками, тексты про запас (посты, рассылки).\n\n"
-            "**Урок 3.2 — От генерации до продажи**\n"
+            "<b>Урок 3.2 — От генерации до продажи</b>\n"
             "• Adobe Stock — принимает ИИ-изображения при маркировке по их правилам\n"
             "• Etsy — digital-товары: шаблоны, планировщики, принты\n"
             "• Свой Telegram-канал — прямые продажи без комиссии площадки\n\n"
-            "**Урок 3.3 — Как поставить на автомат**\n"
+            "<b>Урок 3.3 — Как поставить на автомат</b>\n"
             "Ручная продажа в директ не масштабируется. Решение — автоворонка: комментарий с "
             "кодовым словом в Instagram → сообщение в Direct → оплата в Telegram → выдача доступа. "
             "Кстати, вы прямо сейчас находитесь внутри именно такой автоворонки — этот бот и есть "
             "рабочий пример."
         ),
         (
-            "**Итог — набор на первую неделю**\n\n"
+            "<b>Итог — набор на первую неделю</b>\n\n"
             "✅ Выбрана ниша по чек-листу из урока 1.3\n"
             "✅ Установлен один текстовый и один визуальный инструмент\n"
             "✅ Собран каркас промпта под свою нишу\n"
@@ -732,11 +755,12 @@ async def publish_course_btn(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_for_channel_for_course_post)
     await message.answer(
-        "Отправьте **юзернейм канала** (например `@my_channel`) или его **числовой ID** "
-        "(например `-1001234567890`) — бот должен быть добавлен туда администратором с правом "
-        "публиковать сообщения. Материалы курса «ИИ-Ремесло» уйдут туда серией постов.",
+        "Отправьте <b>юзернейм канала</b> (например <code>@my_channel</code>) или его "
+        "<b>числовой ID</b> (например <code>-1001234567890</code>) — бот должен быть добавлен "
+        "туда администратором с правом публиковать сообщения. Материалы курса «ИИ-Ремесло» "
+        "уйдут туда серией постов.",
         reply_markup=get_cancel_reply_kb(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(AdminStates.waiting_for_channel_for_course_post, F.text)
@@ -747,11 +771,11 @@ async def process_publish_course_input(msg: types.Message, state: FSMContext):
     sent, failed = 0, 0
     for text in posts:
         try:
-            await bot.send_message(chat_id=chat_ref, text=text, parse_mode="Markdown")
+            await bot.send_message(chat_id=chat_ref, text=text, parse_mode="HTML")
         except Exception as e:
-            logging.error(f"Не удалось опубликовать пост курса в {chat_ref} с Markdown: {e}")
+            logging.error(f"Не удалось опубликовать пост курса в {chat_ref} с HTML-разметкой: {e}")
             try:
-                await bot.send_message(chat_id=chat_ref, text=text.replace("**", "").replace("```", ""))
+                await bot.send_message(chat_id=chat_ref, text=strip_html(text))
             except Exception as e2:
                 logging.error(f"Не удалось опубликовать пост курса в {chat_ref} даже без разметки: {e2}")
                 failed += 1
@@ -776,14 +800,14 @@ async def set_pay_token_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_payment_token)
-    await message.answer("Отправьте **Payment Token** ЮKassa от BotFather:", reply_markup=get_cancel_reply_kb())
+    await message.answer("Отправьте <b>Payment Token</b> ЮKassa от BotFather:", reply_markup=get_cancel_reply_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "🎯 Кодовое слово IG")
 async def set_trigger_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_trigger_word)
-    await message.answer("Отправьте новое **кодовое слово** (например: КУРС):", reply_markup=get_cancel_reply_kb())
+    await message.answer("Отправьте новое <b>кодовое слово</b> (например: КУРС):", reply_markup=get_cancel_reply_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "✉️ Текст Direct (IG)")
 async def set_dm_btn(message: types.Message, state: FSMContext):
@@ -791,9 +815,10 @@ async def set_dm_btn(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_for_dm_text)
     await message.answer(
-        "Отправьте новый **текст личного сообщения (Direct)**, "
+        "Отправьте новый <b>текст личного сообщения (Direct)</b>, "
         "которое бот пришлёт пользователю Instagram по кодовому слову:",
-        reply_markup=get_cancel_reply_kb()
+        reply_markup=get_cancel_reply_kb(),
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "💬 Ответ под комментом (IG)")
@@ -802,9 +827,10 @@ async def set_reply_comment_btn(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_for_reply_comment_text)
     await message.answer(
-        "Отправьте новый **текст публичного ответа под комментарием** в Instagram "
-        "(его увидят все, кто зайдёт на пост). Отправьте `-` (дефис), чтобы бот не отвечал под комментарием вообще:",
-        reply_markup=get_cancel_reply_kb()
+        "Отправьте новый <b>текст публичного ответа под комментарием</b> в Instagram "
+        "(его увидят все, кто зайдёт на пост). Отправьте <code>-</code> (дефис), чтобы бот не отвечал под комментарием вообще:",
+        reply_markup=get_cancel_reply_kb(),
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "🔐 Verify Token (IG)")
@@ -813,9 +839,10 @@ async def set_verify_token_btn(message: types.Message, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_for_verify_token)
     await message.answer(
-        "Отправьте новый **Verify Token**. Это произвольная строка (пароль), "
+        "Отправьте новый <b>Verify Token</b>. Это произвольная строка (пароль), "
         "которую нужно будет один в один указать в настройках вебхука в Meta for Developers:",
-        reply_markup=get_cancel_reply_kb()
+        reply_markup=get_cancel_reply_kb(),
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "🔑 Instagram Token")
@@ -823,7 +850,7 @@ async def set_ig_token_btn(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminStates.waiting_for_page_token)
-    await message.answer("Отправьте **Instagram Page Access Token** от Meta Developers:", reply_markup=get_cancel_reply_kb())
+    await message.answer("Отправьте <b>Instagram Page Access Token</b> от Meta Developers:", reply_markup=get_cancel_reply_kb(), parse_mode="HTML")
 
 # --- Обработка FSM ввода ---
 @dp.message(AdminStates.waiting_for_course_photo, F.photo)
@@ -845,13 +872,14 @@ async def process_photo_input_wrong_type(msg: types.Message):
 async def process_start_msg_input(msg: types.Message, state: FSMContext):
     set_setting("course_start_message", msg.text)
     await state.clear()
-    await msg.answer("✅ Текст приветствия `/start` успешно обновлен!", reply_markup=get_admin_reply_kb())
+    await msg.answer("✅ Текст приветствия <code>/start</code> успешно обновлен!", reply_markup=get_admin_reply_kb(), parse_mode="HTML")
 
 @dp.message(AdminStates.waiting_for_course_title, F.text)
 async def process_title_input(msg: types.Message, state: FSMContext):
-    set_setting("course_title", msg.text.strip())
+    title = msg.text.strip()
+    set_setting("course_title", title)
     await state.clear()
-    await msg.answer(f"✅ Название курса изменено на: **{msg.text.strip()}**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+    await msg.answer(f"✅ Название курса изменено на: <b>{html.escape(title)}</b>", reply_markup=get_admin_reply_kb(), parse_mode="HTML")
 
 @dp.message(AdminStates.waiting_for_page_token, F.text)
 async def process_page_token_input(msg: types.Message, state: FSMContext):
@@ -889,9 +917,10 @@ async def process_page_token_input(msg: types.Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_trigger_word, F.text)
 async def process_trigger_input(msg: types.Message, state: FSMContext):
-    set_setting("trigger_word", msg.text.strip().upper())
+    trigger = msg.text.strip().upper()
+    set_setting("trigger_word", trigger)
     await state.clear()
-    await msg.answer(f"✅ Кодовое слово изменено на: **{msg.text.strip().upper()}**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+    await msg.answer(f"✅ Кодовое слово изменено на: <b>{html.escape(trigger)}</b>", reply_markup=get_admin_reply_kb(), parse_mode="HTML")
 
 @dp.message(AdminStates.waiting_for_dm_text, F.text)
 async def process_dm_input(msg: types.Message, state: FSMContext):
@@ -937,7 +966,7 @@ async def process_price_input(msg: types.Message, state: FSMContext):
         rubles = int(msg.text.strip())
         set_setting("course_price", str(rubles * 100))
         await state.clear()
-        await msg.answer(f"✅ Новая цена установлена: **{rubles} ₽**", reply_markup=get_admin_reply_kb(), parse_mode="Markdown")
+        await msg.answer(f"✅ Новая цена установлена: <b>{rubles} ₽</b>", reply_markup=get_admin_reply_kb(), parse_mode="HTML")
     except ValueError:
         await msg.answer("❌ Введите корректное число (только цифры).")
 
@@ -1006,25 +1035,25 @@ async def successful_payment(message: types.Message):
     record_purchase(message.from_user.id, message.successful_payment.total_amount)
     link = get_setting("course_link")
 
-    # Ссылку в кликабельный Markdown-формат [текст](url) оборачиваем только если это
-    # похоже на настоящий URL — иначе (например, если админ по ошибке ввёл "@username"
+    # Ссылку в кликабельный HTML-формат <a href="url">текст</a> оборачиваем только если
+    # это похоже на настоящий URL — иначе (например, если админ по ошибке ввёл "@username"
     # вместо "https://t.me/username") просто показываем её текстом, чтобы её можно было
     # хотя бы скопировать, а не терять сообщение целиком из-за ошибки разметки.
     if link.startswith("http://") or link.startswith("https://") or link.startswith("tg://"):
-        link_line = f"👉 [Перейти к обучению]({link})"
+        link_line = f'👉 <a href="{html.escape(link, quote=True)}">Перейти к обучению</a>'
     else:
-        link_line = f"👉 {link}" if link else "👉 (ссылка не настроена — обратитесь к администратору)"
+        link_line = f"👉 {html.escape(link)}" if link else "👉 (ссылка не настроена — обратитесь к администратору)"
 
     text = (
-        f"🎉 **Оплата прошла успешно!**\n\n"
+        f"🎉 <b>Оплата прошла успешно!</b>\n\n"
         f"Ваша персональная ссылка на материалы курса:\n{link_line}\n\n"
         f"Приятного изучения!"
     )
     try:
-        await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        logging.error(f"Не удалось отправить сообщение об оплате с Markdown-разметкой: {e}")
-        await message.answer(text.replace("**", ""), disable_web_page_preview=True)
+        logging.error(f"Не удалось отправить сообщение об оплате с HTML-разметкой: {e}")
+        await message.answer(strip_html(text), disable_web_page_preview=True)
 
 # --- Сервер Flask (Вебхук Instagram) ---
 @app.route("/", methods=["GET"])
